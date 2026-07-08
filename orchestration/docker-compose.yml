@@ -1,0 +1,68 @@
+# Reproducible local environment: SQL Server + Spark + Airflow.
+# Usage:
+#   docker compose up -d mssql spark        # core stack
+#   docker compose --profile airflow up -d  # + orchestration
+#
+# The project folder is mounted into both Spark and Airflow at /opt/project,
+# so lake zones under data/ are shared exactly as on a dev machine.
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: trafficdw-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "ChangeMe_Demo1!"
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+      - ../sql:/opt/sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'ChangeMe_Demo1!' -Q 'SELECT 1' || exit 1"]
+      interval: 15s
+      retries: 10
+
+  spark:
+    image: bitnami/spark:3.5
+    container_name: trafficdw-spark
+    environment:
+      SPARK_MODE: master
+    ports:
+      - "8080:8080"   # Spark master UI
+      - "7077:7077"
+    volumes:
+      - ..:/opt/project
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark:7077
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: 2g
+    depends_on:
+      - spark
+    volumes:
+      - ..:/opt/project
+
+  airflow:
+    image: apache/airflow:2.9.2
+    profiles: ["airflow"]
+    container_name: trafficdw-airflow
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db  # demo only
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ..:/opt/project
+    command: standalone
+    depends_on:
+      mssql:
+        condition: service_healthy
+
+volumes:
+  mssql-data:

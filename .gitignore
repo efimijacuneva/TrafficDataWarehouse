@@ -1,0 +1,20 @@
+# runtime data lake — regenerate with data_generator + spark jobs
+data/raw/
+data/bronze/
+data/silver/
+data/gold/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# spark local artifacts
+spark-warehouse/
+metastore_db/
+derby.log
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db

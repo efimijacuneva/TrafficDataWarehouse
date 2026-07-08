@@ -1,0 +1,5 @@
+# Spark pipeline + generator. SQL scripts need only SQL Server 2019+ (or the
+# docker-compose stack in orchestration/).
+pyspark==3.5.1
+# Airflow is optional (orchestration/); install via the official constraints file:
+#   pip install "apache-airflow==2.9.2" --constraint <airflow constraints url>
