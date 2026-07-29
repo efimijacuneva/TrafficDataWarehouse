@@ -1,7 +1,7 @@
 """Job 03 — TRANSFORM & AGGREGATE: silver → gold hourly grain.
 
-* enriches detections with the hour's weather (station-hour aggregate joined
-  via BROADCAST — the weather side is tiny)
+* enriches detections with the hour's city-wide weather aggregate (worst
+  condition across stations, joined via BROADCAST — the weather side is tiny)
 * aggregates to the warehouse snapshot grain: segment × hour
 * deliberately mixes the two APIs (docs/07):
     - DataFrame API for pipeline plumbing (joins, caching, writes)

@@ -163,7 +163,10 @@ GO
 /* ============================================================================
    2. PERIODIC SNAPSHOT — fact.FactHourlyTraffic
    Dense grain: segment × hour, INCLUDING zero-traffic hours (spine cross join).
-   Idempotent upsert on the natural key (DateKey, HourOfDay, RoadSegmentKey).
+   Idempotent replace-by-date (delete + insert, like the transaction fact):
+   an upsert keyed on RoadSegmentKey would leave rows of older SCD2 segment
+   versions behind when a date is reprocessed after a version change,
+   double-counting that segment-hour.
    ========================================================================== */
 CREATE OR ALTER PROCEDURE etl.usp_LoadFactHourlyTraffic
     @ETLBatchID INT,
@@ -176,6 +179,12 @@ BEGIN
         DECLARE @DateKey INT = CONVERT(INT, FORMAT(@LoadDate, 'yyyyMMdd'));
 
         BEGIN TRAN;
+
+        /* ---------- idempotency: wipe any previous load of this date ----------
+           (a keyed upsert cannot do this safely: after an SCD2 change the new
+            spine carries new RoadSegmentKeys, so old-version rows would never
+            match and would survive as duplicates of the same segment-hour) */
+        DELETE FROM fact.FactHourlyTraffic WHERE DateKey = @DateKey;
 
         /* spine: every current segment × 24 hours → density guaranteed */
         ;WITH hours AS (
@@ -220,25 +229,14 @@ BEGIN
                   AND w.TempBand = b.TempBand AND w.PrecipBand = b.PrecipBand
                   AND w.VisibilityBand = b.VisibilityBand
         )
-        MERGE fact.FactHourlyTraffic AS tgt
-        USING merged AS src
-           ON tgt.DateKey = @DateKey
-          AND tgt.HourOfDay = src.HourOfDay
-          AND tgt.RoadSegmentKey = src.RoadSegmentKey
-        WHEN MATCHED THEN
-            UPDATE SET WeatherKey = src.WeatherKey,
-                       VehicleCount = src.VehicleCount, HeavyVehicleCount = src.HeavyVehicleCount,
-                       AvgSpeedKmh = src.AvgSpeedKmh, P85SpeedKmh = src.P85SpeedKmh,
-                       AvgOccupancyPct = src.AvgOccupancyPct, CongestionIndex = src.CongestionIndex,
-                       AvgTempC = src.AvgTempC, PrecipitationMm = src.PrecipitationMm,
-                       ETLBatchID = @ETLBatchID
-        WHEN NOT MATCHED BY TARGET THEN
-            INSERT (DateKey, HourOfDay, RoadSegmentKey, WeatherKey, VehicleCount, HeavyVehicleCount,
-                    IncidentCount, AvgSpeedKmh, P85SpeedKmh, AvgOccupancyPct, CongestionIndex,
-                    AvgTempC, PrecipitationMm, ETLBatchID)
-            VALUES (@DateKey, src.HourOfDay, src.RoadSegmentKey, src.WeatherKey, src.VehicleCount,
-                    src.HeavyVehicleCount, 0, src.AvgSpeedKmh, src.P85SpeedKmh, src.AvgOccupancyPct,
-                    src.CongestionIndex, src.AvgTempC, src.PrecipitationMm, @ETLBatchID);
+        INSERT INTO fact.FactHourlyTraffic
+              (DateKey, HourOfDay, RoadSegmentKey, WeatherKey, VehicleCount, HeavyVehicleCount,
+               IncidentCount, AvgSpeedKmh, P85SpeedKmh, AvgOccupancyPct, CongestionIndex,
+               AvgTempC, PrecipitationMm, ETLBatchID)
+        SELECT @DateKey, src.HourOfDay, src.RoadSegmentKey, src.WeatherKey, src.VehicleCount,
+               src.HeavyVehicleCount, 0, src.AvgSpeedKmh, src.P85SpeedKmh, src.AvgOccupancyPct,
+               src.CongestionIndex, src.AvgTempC, src.PrecipitationMm, @ETLBatchID
+        FROM merged AS src;
 
         /* incident counts stamped from the accumulating fact */
         UPDATE f
@@ -319,7 +317,9 @@ BEGIN
            ON tgt.IncidentNumber = src.IncidentNumber
         WHEN MATCHED THEN
             UPDATE SET
-                /* milestones only move forward; a milestone once set is stable */
+                /* milestones are refreshed from the source snapshot: OLTP is
+                   the system of record, and the extract always carries the
+                   full milestone history of each modified incident */
                 DispatchedDateKey = src.DisD, DispatchedTimeKey = src.DisT,
                 ArrivedDateKey    = src.ArrD, ArrivedTimeKey    = src.ArrT,
                 ClearedDateKey    = src.ClrD, ClearedTimeKey    = src.ClrT,
@@ -369,11 +369,12 @@ BEGIN
     SET NOCOUNT ON;
     IF @LoadDate IS NULL SET @LoadDate = CAST(DATEADD(DAY, -1, SYSUTCDATETIME()) AS DATE);
 
-    DECLARE @ETLBatchID INT;
+    DECLARE @ETLBatchID INT, @WatermarkUpper DATETIME2(3);
     EXEC etl.usp_StartBatch 'NightlyWarehouseRefresh', @LoadDate, @ETLBatchID OUTPUT;
 
     BEGIN TRY
-        /* E */ EXEC etl.usp_ExtractFromOLTP        @ETLBatchID, @FullLoad;
+        /* E */ EXEC etl.usp_ExtractFromOLTP        @ETLBatchID, @FullLoad,
+                                                    @WatermarkUpper OUTPUT;
         /* T+L: dimensions BEFORE facts (SK dependency) */
                 EXEC etl.usp_LoadAllDimensions      @ETLBatchID, @LoadDate;
                 EXEC etl.usp_CreateInferredMembers  @ETLBatchID, @LoadDate;
@@ -383,6 +384,14 @@ BEGIN
                 EXEC etl.usp_LoadFactHourlyTraffic     @ETLBatchID, @LoadDate;
         /* housekeeping */
                 EXEC etl.usp_UpdateFactStatistics;
+        /* post-load data-quality run (sql/etl/05_quality_checks.sql, docs/14):
+           log-only inside the batch so Status reflects the LOAD outcome;
+           orchestrators enforce the gate separately via etl.usp_AssertQuality */
+                EXEC etl.usp_RunQualityChecks @ETLBatchID = @ETLBatchID,
+                                              @LoadDate = @LoadDate, @FailOnError = 0;
+        /* advance watermarks LAST: a failure anywhere above leaves them
+           untouched, so the rerun re-extracts the same OLTP delta (docs/06) */
+                EXEC etl.usp_AdvanceWatermarks @ETLBatchID, @WatermarkUpper;
 
         EXEC etl.usp_EndBatch @ETLBatchID, 'Succeeded';
         EXEC etl.usp_ValidateBatch @ETLBatchID;   -- reconciliation report

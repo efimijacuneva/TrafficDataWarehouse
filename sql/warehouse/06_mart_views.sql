@@ -3,6 +3,12 @@
    One view per catalogued business report (reports/report_catalogue.md).
    Views also provide the conformed ROLLUPS of DimRoadSegment (road, location)
    promised by the bus matrix.
+
+   Aggregation rule: AvgSpeedKmh / P85SpeedKmh / CongestionIndex on the hourly
+   snapshot are PRE-AVERAGED measures — rolling them up further must be
+   VOLUME-WEIGHTED (SUM(measure * VehicleCount) / SUM(VehicleCount)), matching
+   the KPI definitions in docs/01 and the Power BI DAX (docs/12). A plain AVG
+   would weight an empty 03:00 hour the same as the 08:00 peak.
    ========================================================================== */
 USE TrafficDW;
 GO
@@ -23,8 +29,10 @@ CREATE OR ALTER VIEW mart.vTopBusiestRoads AS
 SELECT TOP (10) WITH TIES
        s.RoadName, s.RoadCategory,
        SUM(f.VehicleCount)                          AS TotalVehicles,
-       CAST(AVG(f.AvgSpeedKmh)     AS DECIMAL(5,1)) AS AvgSpeedKmh,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion
+       CAST(SUM(f.AvgSpeedKmh     * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(5,1)) AS AvgSpeedKmh,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
 GROUP BY s.RoadName, s.RoadCategory
@@ -36,7 +44,8 @@ CREATE OR ALTER VIEW mart.vAvgSpeedByRoad AS
 SELECT s.RoadName,
        CAST(SUM(f.AvgSpeedKmh * f.VehicleCount) / NULLIF(SUM(f.VehicleCount),0) AS DECIMAL(5,1))
                                                     AS VolumeWeightedSpeed,
-       CAST(AVG(f.P85SpeedKmh) AS DECIMAL(5,1))     AS AvgP85Speed,
+       CAST(SUM(f.P85SpeedKmh * f.VehicleCount) / NULLIF(SUM(f.VehicleCount),0) AS DECIMAL(5,1))
+                                                    AS AvgP85Speed,
        MAX(s.SpeedLimitKmh)                         AS MaxSpeedLimit
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
@@ -49,7 +58,8 @@ CREATE OR ALTER VIEW mart.vMonthlyTraffic AS
 SELECT d.[Year], d.MonthNumber, d.YearMonth,
        SUM(f.VehicleCount)                          AS TotalVehicles,
        SUM(f.HeavyVehicleCount)                     AS HeavyVehicles,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion,
        SUM(f.IncidentCount)                         AS Incidents
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimDate d ON d.DateKey = f.DateKey
@@ -60,8 +70,10 @@ GO
 CREATE OR ALTER VIEW mart.vDailyTraffic AS
 SELECT d.FullDate, d.DayName, d.IsWeekend, d.IsHoliday,
        SUM(f.VehicleCount)                          AS TotalVehicles,
-       CAST(AVG(f.AvgSpeedKmh) AS DECIMAL(5,1))     AS AvgSpeedKmh,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion
+       CAST(SUM(f.AvgSpeedKmh     * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(5,1)) AS AvgSpeedKmh,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimDate d ON d.DateKey = f.DateKey
 GROUP BY d.FullDate, d.DayName, d.IsWeekend, d.IsHoliday;
@@ -72,8 +84,10 @@ CREATE OR ALTER VIEW mart.vRushHourProfile AS
 SELECT f.HourOfDay,
        d.IsWeekend,
        SUM(f.VehicleCount)                          AS TotalVehicles,
-       CAST(AVG(f.AvgSpeedKmh) AS DECIMAL(5,1))     AS AvgSpeedKmh,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion
+       CAST(SUM(f.AvgSpeedKmh     * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(5,1)) AS AvgSpeedKmh,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimDate d ON d.DateKey = f.DateKey
 GROUP BY f.HourOfDay, d.IsWeekend;
@@ -109,8 +123,10 @@ GO
 CREATE OR ALTER VIEW mart.vTrafficByWeather AS
 SELECT w.ConditionName, w.PrecipBand, w.IsSevere,
        SUM(f.VehicleCount)                          AS TotalVehicles,
-       CAST(AVG(f.AvgSpeedKmh) AS DECIMAL(5,1))     AS AvgSpeedKmh,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion
+       CAST(SUM(f.AvgSpeedKmh     * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(5,1)) AS AvgSpeedKmh,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimWeatherCondition w ON w.WeatherKey = f.WeatherKey
 GROUP BY w.ConditionName, w.PrecipBand, w.IsSevere;
@@ -120,7 +136,8 @@ GO
 CREATE OR ALTER VIEW mart.vTrafficByDistrict AS
 SELECT s.City, s.District,
        SUM(f.VehicleCount)                          AS TotalVehicles,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion,
        SUM(f.IncidentCount)                         AS Incidents
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
@@ -131,8 +148,10 @@ GO
 CREATE OR ALTER VIEW mart.vTrafficByWeekday AS
 SELECT d.DayOfWeek, d.DayName,
        SUM(f.VehicleCount)                          AS TotalVehicles,
-       CAST(AVG(f.AvgSpeedKmh) AS DECIMAL(5,1))     AS AvgSpeedKmh,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion
+       CAST(SUM(f.AvgSpeedKmh     * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(5,1)) AS AvgSpeedKmh,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimDate d ON d.DateKey = f.DateKey
 GROUP BY d.DayOfWeek, d.DayName;
@@ -146,7 +165,8 @@ SELECT tl.ControllerCode, tl.IntersectionName,
        tl.CurrentTimingPlan, tl.PreviousTimingPlan, tl.TimingPlanChangeDate,
        tl.CycleSeconds,
        SUM(f.VehicleCount)                              AS ApproachVolume,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3))     AS AvgApproachCongestion,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgApproachCongestion,
        CAST(SUM(1.0 * f.VehicleCount) /
             NULLIF(SUM(3600.0 / tl.CycleSeconds), 0) AS DECIMAL(8,2)) AS VehiclesPerCycle
 FROM fact.FactHourlyTraffic f
@@ -195,8 +215,10 @@ CREATE OR ALTER VIEW mart.vFactDailyTraffic AS
 SELECT f.DateKey, d.FullDate, d.DayName, d.IsWeekend,
        SUM(f.VehicleCount)                           AS TotalVehicles,
        SUM(f.HeavyVehicleCount)                      AS HeavyVehicles,
-       CAST(AVG(f.AvgSpeedKmh) AS DECIMAL(5,1))      AS AvgSpeedKmh,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3))  AS AvgCongestionIndex,
+       CAST(SUM(f.AvgSpeedKmh     * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(5,1)) AS AvgSpeedKmh,
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestionIndex,
        SUM(f.IncidentCount)                          AS Incidents
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimDate d ON d.DateKey = f.DateKey

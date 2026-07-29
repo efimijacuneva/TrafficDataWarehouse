@@ -100,18 +100,23 @@ GO
 /* ============================================================================
    EXTRACT — incremental, high-watermark pattern.
    @FullLoad = 1 resets the watermark (initial population / recovery).
-   The new watermark is captured BEFORE reading (consistent snapshot) and
-   persisted only after the extract succeeds (restart-safe).
+   The upper bound is captured ONCE, BEFORE reading (consistent snapshot), and
+   returned to the caller via @WatermarkUpper. This proc does NOT advance the
+   stored watermarks — etl.usp_AdvanceWatermarks does, called by
+   usp_RunNightlyPipeline as its FINAL step, so a failure anywhere in the
+   pipeline (dims, facts) leaves watermarks untouched and a rerun re-extracts
+   the same OLTP delta (restart-safe).
    ========================================================================== */
 CREATE OR ALTER PROCEDURE etl.usp_ExtractFromOLTP
-    @ETLBatchID INT,
-    @FullLoad   BIT = 0
+    @ETLBatchID     INT,
+    @FullLoad       BIT = 0,
+    @WatermarkUpper DATETIME2(3) = NULL OUTPUT   -- pass to usp_AdvanceWatermarks on success
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    DECLARE @now DATETIME2(3) = SYSUTCDATETIME();
+    SET @WatermarkUpper = SYSUTCDATETIME();   -- one consistent upper bound for ALL extracts
     DECLARE @rows INT;
 
     IF @FullLoad = 1
@@ -134,7 +139,7 @@ BEGIN
         JOIN TrafficOLTP.oltp.Intersection i2 ON i2.IntersectionID = s.EndIntersectionID
         JOIN TrafficOLTP.oltp.Location l      ON l.LocationID = i1.LocationID
         JOIN TrafficOLTP.oltp.District d      ON d.DistrictID = l.DistrictID
-        WHERE s.ModifiedAt > @wmSeg AND s.ModifiedAt <= @now;
+        WHERE s.ModifiedAt > @wmSeg AND s.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.RoadSegment', @rows);
 
@@ -148,7 +153,7 @@ BEGIN
         FROM TrafficOLTP.oltp.Sensor sn
         JOIN TrafficOLTP.oltp.SensorType st  ON st.SensorTypeID = sn.SensorTypeID
         JOIN TrafficOLTP.oltp.RoadSegment seg ON seg.RoadSegmentID = sn.RoadSegmentID
-        WHERE sn.ModifiedAt > @wmSns AND sn.ModifiedAt <= @now;
+        WHERE sn.ModifiedAt > @wmSns AND sn.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.Sensor', @rows);
 
@@ -158,7 +163,7 @@ BEGIN
         SELECT vt.TypeCode, vt.TypeName, vt.Category, vt.IsHeavy, vt.ModifiedAt
         FROM TrafficOLTP.oltp.VehicleType vt
         WHERE vt.ModifiedAt > (SELECT LastWatermark FROM etl.WatermarkControl WHERE SourceTable = 'oltp.VehicleType')
-          AND vt.ModifiedAt <= @now;
+          AND vt.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.VehicleType', @rows);
 
@@ -169,7 +174,7 @@ BEGIN
         FROM TrafficOLTP.oltp.TrafficCamera cm
         JOIN TrafficOLTP.oltp.Intersection i ON i.IntersectionID = cm.IntersectionID
         WHERE cm.ModifiedAt > (SELECT LastWatermark FROM etl.WatermarkControl WHERE SourceTable = 'oltp.TrafficCamera')
-          AND cm.ModifiedAt <= @now;
+          AND cm.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.TrafficCamera', @rows);
 
@@ -180,7 +185,7 @@ BEGIN
         FROM TrafficOLTP.oltp.TrafficLight tl
         JOIN TrafficOLTP.oltp.Intersection i ON i.IntersectionID = tl.IntersectionID
         WHERE tl.ModifiedAt > (SELECT LastWatermark FROM etl.WatermarkControl WHERE SourceTable = 'oltp.TrafficLight')
-          AND tl.ModifiedAt <= @now;
+          AND tl.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.TrafficLight', @rows);
 
@@ -190,7 +195,7 @@ BEGIN
         SELECT it.TypeCode, it.TypeName, it.Category, it.DefaultSeverity, it.ModifiedAt
         FROM TrafficOLTP.oltp.IncidentType it
         WHERE it.ModifiedAt > (SELECT LastWatermark FROM etl.WatermarkControl WHERE SourceTable = 'oltp.IncidentType')
-          AND it.ModifiedAt <= @now;
+          AND it.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.IncidentType', @rows);
 
@@ -201,7 +206,7 @@ BEGIN
         FROM TrafficOLTP.oltp.EmergencyVehicle ev
         JOIN TrafficOLTP.oltp.Vehicle v ON v.VehicleID = ev.VehicleID
         WHERE ev.ModifiedAt > (SELECT LastWatermark FROM etl.WatermarkControl WHERE SourceTable = 'oltp.EmergencyVehicle')
-          AND ev.ModifiedAt <= @now;
+          AND ev.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.EmergencyUnit', @rows);
 
@@ -229,18 +234,41 @@ BEGIN
                      FROM TrafficOLTP.oltp.WeatherObservation o
                      WHERE o.ObservedAt <= inc.DetectedAt
                      ORDER BY o.ObservedAt DESC) w
-        WHERE inc.ModifiedAt > @wmInc AND inc.ModifiedAt <= @now;
+        WHERE inc.ModifiedAt > @wmInc AND inc.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.IncidentLifecycle', @rows);
 
-        /* --------------------- advance ALL watermarks only after full success */
-        UPDATE etl.WatermarkControl
-        SET LastWatermark = @now, UpdatedAt = SYSUTCDATETIME();
+        /* watermarks are deliberately NOT advanced here — see usp_AdvanceWatermarks */
     END TRY
     BEGIN CATCH
         EXEC etl.usp_LogError @ETLBatchID;
         THROW;
     END CATCH
+END
+GO
+
+/* ============================================================================
+   ADVANCE WATERMARKS — the restart-safety anchor.
+   Called by usp_RunNightlyPipeline as the LAST step of a successful run,
+   with the upper bound the extract actually used. Any failure before this
+   point leaves LastWatermark unchanged, so the failed batch's OLTP delta is
+   re-extracted on the next run instead of being skipped forever.
+   ========================================================================== */
+CREATE OR ALTER PROCEDURE etl.usp_AdvanceWatermarks
+    @ETLBatchID     INT,
+    @WatermarkUpper DATETIME2(3)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF @WatermarkUpper IS NULL RETURN;   -- nothing was extracted this run
+
+    DECLARE @rows INT;
+    UPDATE etl.WatermarkControl
+    SET LastWatermark = @WatermarkUpper, UpdatedAt = SYSUTCDATETIME();
+    SET @rows = @@ROWCOUNT;
+
+    INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsUpdated)
+    VALUES (@ETLBatchID, 'AdvanceWatermarks', @rows);
 END
 GO
 

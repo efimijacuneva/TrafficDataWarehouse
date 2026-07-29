@@ -1,5 +1,9 @@
 # Part 11 — Business Report Catalogue
 
+> Interactive counterpart: the five Power BI dashboards in
+> [docs/12_powerbi_dashboards.md](../docs/12_powerbi_dashboards.md) read the same
+> star schema through `mart.vPbi*` semantic views — figures agree by construction.
+
 Every report is backed by a `mart` view ([sql/warehouse/06_mart_views.sql](../sql/warehouse/06_mart_views.sql))
 so BI tools, analysts and this catalogue share one definition. Frequencies assume the
 nightly warehouse refresh; "hourly" reports additionally use the intraday snapshot refresh.

@@ -222,7 +222,7 @@ WHERE i.Status <> 'Detected';
 INSERT INTO oltp.Maintenance (MaintenanceType, SensorID, TrafficLightID, CameraID, RoadSegmentID, StartDate, EndDate, CostEur)
 SELECT CASE n.i % 4 WHEN 0 THEN 'Calibration' WHEN 1 THEN 'Repair' WHEN 2 THEN 'Resurfacing' ELSE 'Replacement' END,
        CASE WHEN n.i % 4 = 0 THEN 1 + n.i % 200 END,
-       CASE WHEN n.i % 4 = 1 THEN 1 + n.i % 45  END,
+       CASE WHEN n.i % 4 = 1 THEN 1 + n.i % 30  END,
        CASE WHEN n.i % 4 = 3 THEN 1 + n.i % 50  END,
        CASE WHEN n.i % 4 = 2 THEN 1 + n.i % 120 END,
        DATEADD(DAY, -(n.i * 5 % 300), '2026-06-30'),

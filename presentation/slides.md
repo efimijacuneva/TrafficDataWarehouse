@@ -117,7 +117,7 @@ flowchart TD
     STG --> D1[SCD1 merges] --> D2[SCD2 versioning] --> D3[SCD3 shift]
     D3 --> INF[Inferred members<br/>late-arriving dims]
     INF --> FT[FactTrafficEvent<br/>delete-by-date + insert]
-    INF --> FH[FactHourlyTraffic<br/>dense upsert]
+    INF --> FH[FactHourlyTraffic<br/>dense reload per date]
     INF --> FI[FactIncidentLifecycle<br/>milestone MERGE]
     FT & FH & FI --> Q[Reconciliation<br/>extracted = loaded + rejected]
     Q --> LOG[(BatchLog · RowLog · ErrorLog · Rejects)]

@@ -70,10 +70,13 @@ with DAG(
 
     quality = BashOperator(
         task_id="sql_quality_checks",
-        # -b: exit non-zero (fail the task) if the checks RAISERROR
+        # the pipeline proc already RAN the checks (log-only); this gate task
+        # asserts on the results — usp_AssertQuality THROWs on any failed
+        # Error-severity check, and -b turns that into a non-zero exit that
+        # fails the task (sql/etl/05_quality_checks.sql, docs/14)
         bash_command=(
             f'{SQLCMD} "DECLARE @b INT = (SELECT MAX(ETLBatchID) FROM etl.BatchLog); '
-            f'EXEC etl.usp_ValidateBatch @b;"'
+            f'EXEC etl.usp_AssertQuality @b;"'
         ),
     )
 

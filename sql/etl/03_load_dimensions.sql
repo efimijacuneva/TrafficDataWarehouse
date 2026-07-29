@@ -401,20 +401,21 @@ BEGIN
         MERGE dim.DimTrafficLight AS tgt
         USING stg.TrafficLight AS src
            ON tgt.ControllerCode = src.ControllerCode
-        /* Type 3 shift: current → previous, new value becomes current */
-        WHEN MATCHED AND tgt.CurrentTimingPlan <> src.TimingPlan THEN
-            UPDATE SET PreviousTimingPlan   = tgt.CurrentTimingPlan,
-                       CurrentTimingPlan    = src.TimingPlan,
-                       TimingPlanChangeDate = @LoadDate,
-                       IntersectionName     = src.IntersectionName,
-                       CycleSeconds         = src.CycleSeconds,
-                       Status               = src.Status,
-                       ETLBatchID           = @ETLBatchID
+        /* Type 3 shift (current → previous) on a timing-plan change; all other
+           attributes are Type 1 (overwrite). Combined into ONE WHEN MATCHED
+           branch via CASE because T-SQL allows only a single WHEN MATCHED
+           UPDATE clause. When the plan is unchanged the CASE columns keep their
+           values and CurrentTimingPlan = src.TimingPlan is a no-op. */
         WHEN MATCHED THEN
-            UPDATE SET IntersectionName = src.IntersectionName,   -- non-Type-3 attributes: Type 1
-                       CycleSeconds     = src.CycleSeconds,
-                       Status           = src.Status,
-                       ETLBatchID       = @ETLBatchID
+            UPDATE SET PreviousTimingPlan   = CASE WHEN tgt.CurrentTimingPlan <> src.TimingPlan
+                                                   THEN tgt.CurrentTimingPlan ELSE tgt.PreviousTimingPlan END,
+                       TimingPlanChangeDate = CASE WHEN tgt.CurrentTimingPlan <> src.TimingPlan
+                                                   THEN @LoadDate ELSE tgt.TimingPlanChangeDate END,
+                       CurrentTimingPlan    = src.TimingPlan,
+                       IntersectionName     = src.IntersectionName,   -- Type 1
+                       CycleSeconds         = src.CycleSeconds,       -- Type 1
+                       Status               = src.Status,             -- Type 1
+                       ETLBatchID           = @ETLBatchID
         WHEN NOT MATCHED BY TARGET THEN
             INSERT (ControllerCode, IntersectionName, CurrentTimingPlan, PreviousTimingPlan,
                     TimingPlanChangeDate, CycleSeconds, Status, ETLBatchID)

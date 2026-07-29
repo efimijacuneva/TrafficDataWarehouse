@@ -9,7 +9,7 @@
 | Object | Index | Why |
 |---|---|---|
 | `fact.FactTrafficEvent` | **Clustered columnstore (CCI)**, partition-aligned | Pure scan/aggregate workload over billions of rows: ~10× compression, batch-mode execution, segment elimination on DateKey. No PK-style clustered B-tree — point lookups don't happen here |
-| `fact.FactHourlyTraffic` | Clustered B-tree `(DateKey, HourOfDay, RoadSegmentKey)` + **nonclustered columnstore** | Upserted hourly (CCI dislikes updates) → rowstore clustered for the merge path, NCCI for analytical scans — a classic HTAP split |
+| `fact.FactHourlyTraffic` | Clustered B-tree `(DateKey, HourOfDay, RoadSegmentKey)` + **nonclustered columnstore** | Reloaded per date + refreshed intraday (CCI dislikes deletes/updates) → rowstore clustered for the write path, NCCI for analytical scans — a classic HTAP split |
 | `fact.FactIncidentLifecycle` | Clustered B-tree on `IncidentKey`, NC indexes on milestone date keys | Small, update-in-place table; B-tree is correct, columnstore would fragment |
 | Dimensions | Clustered PK on surrogate key + **unique NC on (BK, IsCurrent) filtered `WHERE IsCurrent=1`** + NC on BK+validity dates | SK joins from facts; fast current-row SCD lookups; point-in-time lookups |
 | Staging | Heaps, no indexes | Bulk-load speed; indexes would only slow truncate-and-load |
@@ -42,11 +42,11 @@ case of stale-stats misestimates on "yesterday" predicates.
 |---|---|---|
 | **Broadcast join** | Segment/station lookups in jobs 03/05 (`broadcast(dim_df)`) | Eliminates shuffle of the 80M-row side entirely; small table shipped to every executor |
 | **Shuffle tuning** | `spark.sql.shuffle.partitions` sized ≈ input-partitions; **AQE on** (`adaptive.enabled`, `coalescePartitions`, `skewJoin`) | No 200-empty-task default; skewed segment hot-spots split automatically |
-| **Caching** | `df.cache()` on the cleaned detections DF in job 03 — reused by 3 aggregations | Avoids re-reading/re-validating silver three times; unpersisted after use |
+| **Caching** | `df.cache()` on the cleaned detections DF in job 03 — reused by the hourly aggregation and the event-grain gold write | Avoids re-reading/re-validating silver per consumer; unpersisted after use |
 | **Partition-aware writes** | `repartition("event_date")` + `partitionOverwriteMode=dynamic` | Few large files, idempotent day-level reruns |
 | **Explicit schemas** | all readers | Skips inference pass; stable types |
 | **Parquet pushdown/pruning** | all readers | See doc 08 |
-| **Kryo + tuned executor memory** | `config/spark_config.py` | Cheaper serialization in shuffles |
+| **Kryo serialization** | `config/spark_config.py` | Cheaper serialization in shuffles/caches |
 
 ## Measured expectations (design targets)
 - Hourly snapshot query (30 days, one road): CCI segment elimination + month partitions →

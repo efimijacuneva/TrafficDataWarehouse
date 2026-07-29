@@ -40,7 +40,8 @@ denormalized into it; they are conformed columns, not separate joins on the fact
      cannot; "which segments were empty at 03:00" is a valid question.
   3. **Semi-additive measures** — `CongestionIndex`, `P85Speed` are precomputed correctly
      (volume-weighted) once, instead of being mis-averaged by report writers.
-- Weather is attached at snapshot grain (dominant condition of the hour at nearest station).
+- Weather is attached at snapshot grain (dominant = worst condition reported across the
+  city's stations that hour).
 
 ### 3. Incident lifecycle — accumulating snapshot
 - **Grain statement:** *one row per incident, inserted at detection and UPDATEd as each

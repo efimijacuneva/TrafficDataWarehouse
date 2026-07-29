@@ -41,8 +41,9 @@ slowly changing history. Each engine does only what it is best at.
 2. **`02_clean_validate.py`** — the data-quality gate: null/range/domain rules from
    `utils/quality.py`, deduplication with `row_number()` over the business event key,
    timestamp normalization, quarantine writing. Emits a per-rule quality metrics dataset.
-3. **`03_transform_aggregate.py`** — enriches detections with weather (as-of join on the
-   nearest station/hour), derives congestion measures, aggregates to segment×hour grain.
+3. **`03_transform_aggregate.py`** — enriches detections with the hour's city-wide weather
+   aggregate (worst condition reported across stations, averaged temperature — joined via
+   broadcast), derives congestion measures, aggregates to segment×hour grain.
    Demonstrates **both APIs deliberately**: DataFrame API for the pipeline plumbing,
    **Spark SQL** for the business aggregations (readable by analysts).
 4. **`04_generate_kpis.py`** — computes the KPI catalogue (congestion index, P85 speeds,
@@ -61,7 +62,8 @@ Both compile to the same Catalyst logical plan — the choice is about *audience
 
 ## Key techniques used in the code
 
-- Explicit `StructType` schemas (never `inferSchema` in production — one pass, stable types).
+- Explicit `StructType` schema for the high-volume CSV feed (no inference pass, stable
+  types, `_corrupt_record` capture); the small JSON feeds are read schema-on-read.
 - `broadcast()` hints for small dimension lookups (weather stations, segments) — doc 09.
 - Repartition-by-partition-column before write → one tidy file per date partition instead
   of hundreds of small files.

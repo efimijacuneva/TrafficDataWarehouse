@@ -22,8 +22,8 @@ GO
 
 /* ============================================================================
    fact.FactHourlyTraffic — HTAP split:
-   clustered B-tree (created with the PK) serves the hourly UPSERT path;
-   a NONCLUSTERED COLUMNSTORE serves analytical scans.
+   clustered B-tree (created with the PK) serves the delete-and-reload write
+   path; a NONCLUSTERED COLUMNSTORE serves analytical scans.
    ========================================================================== */
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'NCCI_FactHourlyTraffic'

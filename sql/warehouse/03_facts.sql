@@ -50,7 +50,7 @@ GO
 /* ============================================================================
    2. PERIODIC SNAPSHOT FACT — fact.FactHourlyTraffic
    Grain: one row per road segment per clock hour (rows exist for zero traffic).
-   Idempotent upsert on the natural key. Rowstore clustered + NCCI (05).
+   Replaced per load date (delete + insert). Rowstore clustered + NCCI (05).
    ========================================================================== */
 CREATE TABLE fact.FactHourlyTraffic (
     DateKey            INT          NOT NULL CONSTRAINT FK_FHT_Date    REFERENCES dim.DimDate(DateKey),
