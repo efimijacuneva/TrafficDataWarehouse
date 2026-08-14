@@ -12,7 +12,16 @@
 USE TrafficDW;
 GO
 
+/* NOTE ON RE-RUNNING: every CREATE TABLE below is guarded so this file can be
+   deployed against an existing database without erroring on the second run -
+   the procedures already use CREATE OR ALTER. The guard has one consequence to
+   be aware of: it also means a CHANGED column definition will NOT be applied to
+   an existing table. Schema changes therefore require either an explicit ALTER
+   (see the Rationale column in 05_quality_checks.sql) or a fresh deploy, which
+   is what scripts/run_end_to_end.ps1 does by dropping both databases first. */
+
 /* --------------------------------------------------------- DimDate (SCD 0) */
+IF OBJECT_ID('dim.DimDate') IS NULL
 CREATE TABLE dim.DimDate (
     DateKey        INT          NOT NULL CONSTRAINT PK_DimDate PRIMARY KEY,  -- yyyymmdd
     FullDate       DATE         NULL,
@@ -32,6 +41,7 @@ CREATE TABLE dim.DimDate (
 );
 
 /* ------------------------------------------------ DimTime (SCD 0, minute grain) */
+IF OBJECT_ID('dim.DimTime') IS NULL
 CREATE TABLE dim.DimTime (
     TimeKey     SMALLINT    NOT NULL CONSTRAINT PK_DimTime PRIMARY KEY,      -- 0..1439
     TimeBK      CHAR(5)     NOT NULL,        -- 'HH:MM'
@@ -43,6 +53,7 @@ CREATE TABLE dim.DimTime (
 );
 
 /* --------------------------------------------- DimRoadSegment (SCD 2, flattened) */
+IF OBJECT_ID('dim.DimRoadSegment') IS NULL
 CREATE TABLE dim.DimRoadSegment (
     RoadSegmentKey     INT IDENTITY(1,1) CONSTRAINT PK_DimRoadSegment PRIMARY KEY,
     SegmentCode        VARCHAR(30)   NOT NULL,          -- business key
@@ -74,6 +85,7 @@ CREATE UNIQUE INDEX UXF_DimSeg_CurrentBK ON dim.DimRoadSegment (SegmentCode) WHE
 CREATE INDEX IX_DimSeg_BK_Validity ON dim.DimRoadSegment (SegmentCode, EffectiveDate, ExpirationDate);
 
 /* ---------------------------------------------------------- DimSensor (SCD 2) */
+IF OBJECT_ID('dim.DimSensor') IS NULL
 CREATE TABLE dim.DimSensor (
     SensorKey       INT IDENTITY(1,1) CONSTRAINT PK_DimSensor PRIMARY KEY,
     SerialNumber    VARCHAR(30)   NOT NULL,             -- business key
@@ -95,6 +107,7 @@ CREATE UNIQUE INDEX UXF_DimSensor_CurrentBK ON dim.DimSensor (SerialNumber) WHER
 CREATE INDEX IX_DimSensor_BK_Validity ON dim.DimSensor (SerialNumber, EffectiveDate, ExpirationDate);
 
 /* ---------------------------------------------------- DimVehicleType (SCD 1) */
+IF OBJECT_ID('dim.DimVehicleType') IS NULL
 CREATE TABLE dim.DimVehicleType (
     VehicleTypeKey INT IDENTITY(1,1) CONSTRAINT PK_DimVehicleType PRIMARY KEY,
     TypeCode       VARCHAR(10)  NOT NULL,               -- business key
@@ -106,6 +119,7 @@ CREATE TABLE dim.DimVehicleType (
 CREATE UNIQUE INDEX UX_DimVehicleType_BK ON dim.DimVehicleType (TypeCode);
 
 /* ----------------------------------------- DimWeatherCondition (banded, SCD 0/1) */
+IF OBJECT_ID('dim.DimWeatherCondition') IS NULL
 CREATE TABLE dim.DimWeatherCondition (
     WeatherKey     INT IDENTITY(1,1) CONSTRAINT PK_DimWeather PRIMARY KEY,
     ConditionCode  VARCHAR(10) NOT NULL,   -- DRY/RAIN/SNOW/FOG/ICE/STORM
@@ -119,6 +133,7 @@ CREATE UNIQUE INDEX UX_DimWeather_BK
     ON dim.DimWeatherCondition (ConditionCode, TempBand, PrecipBand, VisibilityBand);
 
 /* --------------------------------------------------- DimTrafficCamera (SCD 1) */
+IF OBJECT_ID('dim.DimTrafficCamera') IS NULL
 CREATE TABLE dim.DimTrafficCamera (
     CameraKey       INT IDENTITY(1,1) CONSTRAINT PK_DimCamera PRIMARY KEY,
     CameraCode      VARCHAR(20)   NOT NULL,             -- business key
@@ -132,6 +147,7 @@ CREATE TABLE dim.DimTrafficCamera (
 CREATE UNIQUE INDEX UX_DimCamera_BK ON dim.DimTrafficCamera (CameraCode);
 
 /* ---------------------------------------------------- DimTrafficLight (SCD 3) */
+IF OBJECT_ID('dim.DimTrafficLight') IS NULL
 CREATE TABLE dim.DimTrafficLight (
     TrafficLightKey      INT IDENTITY(1,1) CONSTRAINT PK_DimLight PRIMARY KEY,
     ControllerCode       VARCHAR(20)   NOT NULL,        -- business key
@@ -146,6 +162,7 @@ CREATE TABLE dim.DimTrafficLight (
 CREATE UNIQUE INDEX UX_DimLight_BK ON dim.DimTrafficLight (ControllerCode);
 
 /* ---------------------------------------------------- DimIncidentType (SCD 1) */
+IF OBJECT_ID('dim.DimIncidentType') IS NULL
 CREATE TABLE dim.DimIncidentType (
     IncidentTypeKey INT IDENTITY(1,1) CONSTRAINT PK_DimIncidentType PRIMARY KEY,
     TypeCode        VARCHAR(10)  NOT NULL,              -- business key
@@ -157,6 +174,7 @@ CREATE TABLE dim.DimIncidentType (
 CREATE UNIQUE INDEX UX_DimIncidentType_BK ON dim.DimIncidentType (TypeCode);
 
 /* --------------------------------------------------- DimEmergencyUnit (SCD 1) */
+IF OBJECT_ID('dim.DimEmergencyUnit') IS NULL
 CREATE TABLE dim.DimEmergencyUnit (
     EmergencyUnitKey INT IDENTITY(1,1) CONSTRAINT PK_DimEmergencyUnit PRIMARY KEY,
     UnitCode        VARCHAR(20)   NOT NULL,             -- business key

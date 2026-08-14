@@ -1,10 +1,23 @@
-# Reproducible local environment: SQL Server + Spark + Airflow.
-# Usage:
-#   docker compose up -d mssql spark        # core stack
-#   docker compose --profile airflow up -d  # + orchestration
+# Reproducible local environment: SQL Server + Spark (+ optional Airflow).
 #
-# The project folder is mounted into both Spark and Airflow at /opt/project,
-# so lake zones under data/ are shared exactly as on a dev machine.
+# Usage:
+#   docker compose up -d mssql spark        # core stack — this is what the
+#                                           # one-command script starts for you
+#   docker compose --profile airflow up -d  # + orchestration demo
+#
+# The project folder is mounted into Spark (and Airflow) at /opt/project, so the
+# lake zones under data/ are shared with the host exactly as on a dev machine —
+# you can inspect Parquet output from Windows while Spark writes it from Linux.
+#
+# WHY THE SPARK SERVICE IS NOT A CLUSTER
+# --------------------------------------
+# It previously started a Spark master + worker pair, but every job builds its
+# session with .master("local[*]") (spark/config/spark_config.py) and no submit
+# ever passed --master, so the cluster was decorative: the daemons ran and
+# nothing connected to them. At this project's data volume (~300k rows/day) a
+# local[*] session inside one container is the honest and correct choice, so the
+# service is now simply a long-lived Spark runtime that `docker exec` submits
+# into. Scaling out is a --master flag away if the volume ever justifies it.
 services:
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
@@ -19,47 +32,68 @@ services:
       - mssql-data:/var/opt/mssql
       - ../sql:/opt/sql:ro
     healthcheck:
+      # the script waits on this before deploying any schema
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'ChangeMe_Demo1!' -Q 'SELECT 1' || exit 1"]
-      interval: 15s
-      retries: 10
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
   spark:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.1
     container_name: trafficdw-spark
+    # long-lived idle container; jobs are submitted with `docker exec`
+    command: ["/bin/bash", "-c", "trap : TERM INT; sleep infinity & wait"]
+    user: root                      # needs write access to the mounted data/ lake
     environment:
-      SPARK_MODE: master
-    ports:
-      - "8080:8080"   # Spark master UI
-      - "7077:7077"
+      # spark/config/spark_config.py reads this to build the JDBC URL; `mssql`
+      # is the compose service name and resolves on the default network
+      SQL_SERVER_HOST: mssql
+      PYSPARK_PYTHON: /usr/bin/python3
+      PYSPARK_DRIVER_PYTHON: /usr/bin/python3
     volumes:
       - ..:/opt/project
-
-  spark-worker:
-    image: bitnami/spark:3.5
-    environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark:7077
-      SPARK_WORKER_CORES: "2"
-      SPARK_WORKER_MEMORY: 2g
+      # the MS SQL JDBC driver lives here; scripts/run_end_to_end.ps1 downloads
+      # it once on first run so job 05 never depends on --packages resolving
+      # against the internet mid-pipeline
+      - ./jars:/opt/jars
     depends_on:
-      - spark
-    volumes:
-      - ..:/opt/project
+      mssql:
+        condition: service_healthy
 
+  # OPTIONAL orchestration demo (docs/11). It reuses the SAME execution model as
+  # scripts/run_end_to_end.ps1 — every task `docker exec`s into the containers
+  # above — so there is one way to run this pipeline, not two.
+  #
+  # The base apache/airflow image contains neither spark-submit nor sqlcmd, so
+  # the DAG's tasks could never have run as originally written. It gets the
+  # Docker CLI (a single static binary) plus the host socket instead, which is
+  # far lighter than installing Spark and mssql-tools into the image.
   airflow:
     image: apache/airflow:2.9.2
     profiles: ["airflow"]
     container_name: trafficdw-airflow
+    user: root                      # needed to reach /var/run/docker.sock
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db  # demo only
+      SQL_PASSWORD: "ChangeMe_Demo1!"
     ports:
       - "8081:8080"
     volumes:
       - ./dags:/opt/airflow/dags
       - ..:/opt/project
-    command: standalone
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "installing docker CLI..."
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-24.0.7.tgz \
+            | tar xz --strip-components=1 -C /usr/local/bin docker/docker
+        fi
+        exec airflow standalone
     depends_on:
       mssql:
         condition: service_healthy

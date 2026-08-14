@@ -24,7 +24,8 @@ current dimension rows; loading facts first would orphan them.
 ## Extract
 
 - **OLTP reference data** — *incremental by high watermark*: every mutable OLTP table has
-  `ModifiedAt datetime2` (+ `rowversion`). `etl.WatermarkControl` stores the last extracted
+  `ModifiedAt datetime2`. (There is **no** `rowversion` column — see the limitation noted
+  in doc 02.) `etl.WatermarkControl` stores the last extracted
   value per table; each run captures one upper bound and extracts
   `WHERE ModifiedAt > @lastWatermark AND ModifiedAt <= @watermarkUpper`. The extract proc
   **returns** the upper bound instead of persisting it; `etl.usp_AdvanceWatermarks` writes it
@@ -34,7 +35,8 @@ current dimension rows; loading facts first would orphan them.
 - **File feeds (CSV/JSON)** — landed to the lake and processed by Spark (doc 07); Spark's
   gold output is bulk-inserted into `stg.*` via JDBC.
 - **Full load** — supported for initial population and disaster recovery:
-  `EXEC etl.usp_RunFullLoad` resets watermarks to `1900-01-01` and truncates staging;
+  `EXEC etl.usp_RunNightlyPipeline @LoadDate = '<date>', @FullLoad = 1` resets every
+  watermark to `1900-01-01` so the next extract reads the whole source;
   SCD2 logic is naturally idempotent (unchanged hashes → no-op), so a full re-extract does
   not create duplicate versions.
 
@@ -42,9 +44,9 @@ current dimension rows; loading facts first would orphan them.
 
 | Rule class | Examples |
 |---|---|
-| **Data cleansing** | Trim/upper-case codes; normalize `'N/A'/''/'-'` to NULL; clamp `OccupancyPct` to [0,100]; standardize direction codes (`NB/SB/EB/WB`) |
+| **Data cleansing** | Trim/upper-case codes; normalize `'N/A'/''/'-'` to NULL; standardize direction codes (`NB/SB/EB/WB`). Out-of-range occupancy is **quarantined, not clamped** — silently rewriting a measure would hide a broken sensor |
 | **Validation** | Speed in (0, 250] km/h; timestamps not in future & within batch window; FK candidate exists or → unknown/inferred member; mandatory columns present |
-| **Duplicate removal** | Dedup on the business event identity `EventID` keeping the latest arrival — `ROW_NUMBER() OVER (PARTITION BY EventID ORDER BY …) = 1` (Spark orders by `_ingest_ts`, the SQL load by `EventTimestamp`); duplicates are quarantined with reason `DUPLICATE` |
+| **Duplicate removal** | Dedup on the business event identity `EventID` — `ROW_NUMBER() OVER (PARTITION BY EventID ORDER BY …) = 1`. Spark orders by `event_ts DESC, _source_file, detector_code` (**not** `_ingest_ts`: that is `current_timestamp()`, one constant per query, which made the survivor arbitrary); the SQL load orders by `EventTimestamp DESC`. Duplicates are quarantined with reason `DUPLICATE`, never dropped |
 | **Derivation** | `SpeedOverLimitKmh`, `CongestionIndex = 1 − AvgSpeed/SpeedLimit`, weather banding, DateKey/TimeKey computation |
 
 Rejected rows are **never discarded**: they go to `stg.RejectTrafficEvent` with

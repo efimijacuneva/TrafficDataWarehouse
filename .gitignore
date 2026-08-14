@@ -14,6 +14,12 @@ spark-warehouse/
 metastore_db/
 derby.log
 
+# downloaded JDBC driver — provisioned on first run by scripts/run_end_to_end.ps1
+orchestration/jars/
+
+# pytest
+.pytest_cache/
+
 # IDE / OS
 .vscode/
 .idea/

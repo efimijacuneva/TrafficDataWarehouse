@@ -17,8 +17,10 @@ SELECT TOP (10) WITH TIES
        s.RoadCategory,
        SUM(f.VehicleCount)                          AS TotalVehicles,
        SUM(f.HeavyVehicleCount)                     AS HeavyVehicles,
-       CAST(AVG(f.AvgSpeedKmh)     AS DECIMAL(5,1)) AS AvgSpeed,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion
+       CAST(SUM(f.AvgSpeedKmh     * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(5,1)) AS AvgSpeed,      -- volume-weighted
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion  -- volume-weighted
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
 JOIN dim.DimDate d        ON d.DateKey = f.DateKey
@@ -85,12 +87,14 @@ SELECT tr.RoadName, tr.TotalVehicles, worst.HourOfDay, worst.AvgCongestion
 FROM top_roads tr
 CROSS APPLY (
     SELECT TOP (3) f.HourOfDay,
-           CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion
+           CAST(SUM(f.CongestionIndex * f.VehicleCount)
+                / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion
     FROM fact.FactHourlyTraffic f
     JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
     WHERE s.RoadName = tr.RoadName AND f.CongestionIndex IS NOT NULL
     GROUP BY f.HourOfDay
-    ORDER BY AVG(f.CongestionIndex) DESC
+    HAVING SUM(f.VehicleCount) > 0
+    ORDER BY SUM(f.CongestionIndex * f.VehicleCount) / NULLIF(SUM(f.VehicleCount), 0) DESC
 ) worst
 ORDER BY tr.TotalVehicles DESC, worst.AvgCongestion DESC;
 GO

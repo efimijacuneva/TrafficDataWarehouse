@@ -45,11 +45,29 @@ CREATE TABLE etl.QualityCheckCatalog (
     Category    VARCHAR(40)   NOT NULL,   -- Integrity / Uniqueness / SCD / Validity / Completeness / Reconciliation
     TargetTable VARCHAR(200)  NOT NULL,
     Severity    VARCHAR(10)   NOT NULL CONSTRAINT CK_QCC_Sev CHECK (Severity IN ('Error','Warning')),
-    Rationale   NVARCHAR(400) NOT NULL,   -- WHY the rule exists (see docs/14)
+    /* WHY the rule exists (docs/14). This column is the LIVE DOCUMENTATION of
+       the framework — docs/14 states that `SELECT * FROM etl.QualityCheckCatalog`
+       is always current. It was NVARCHAR(400), which silently became a hard
+       limit on how well a rule could be explained: two rationales hit 417 and
+       420 characters and the deployment failed with "String or binary data
+       would be truncated". Widened rather than abbreviating the explanations,
+       because the text is the point of the column. */
+    Rationale   NVARCHAR(1000) NOT NULL,
     CountQuery  NVARCHAR(MAX) NOT NULL,   -- scalar SELECT → failed-row count; params: @ETLBatchID, @LoadDate, @DateKey
     IsEnabled   BIT           NOT NULL CONSTRAINT DF_QCC_On DEFAULT 1,
     SortOrder   SMALLINT      NOT NULL CONSTRAINT DF_QCC_Sort DEFAULT 100
 );
+GO
+
+/* Widen the column on deployments created before it was enlarged. The CREATE
+   above is guarded by IF OBJECT_ID(...) IS NULL, so re-running this script
+   against an existing database would otherwise keep the old 400-char column
+   and fail on the INSERTs below. */
+IF EXISTS (SELECT 1 FROM sys.columns
+           WHERE object_id = OBJECT_ID('etl.QualityCheckCatalog')
+             AND name = 'Rationale'
+             AND max_length < 2000)          -- NVARCHAR: bytes, so 1000 chars = 2000
+    ALTER TABLE etl.QualityCheckCatalog ALTER COLUMN Rationale NVARCHAR(1000) NOT NULL;
 GO
 
 /* The catalog is code, not data: redeploying this script resets it. */
@@ -75,6 +93,15 @@ INSERT INTO etl.QualityCheckCatalog (CheckName, Category, TargetTable, Severity,
 ('ORPHAN_FTE_SENSOR', 'Integrity', 'fact.FactTrafficEvent', 'Error',
  N'Sensor keys come from point-in-time SCD2 lookups; a wrong validity join produces keys of expired versions that were deleted or never existed.',
  N'SELECT COUNT(*) FROM fact.FactTrafficEvent f WHERE f.DateKey = @DateKey AND NOT EXISTS (SELECT 1 FROM dim.DimSensor d WHERE d.SensorKey = f.SensorKey)', 13),
+('ORPHAN_FTE_CAMERA', 'Integrity', 'fact.FactTrafficEvent', 'Error',
+ N'Camera detections resolve against DimTrafficCamera while sensor detections take the unknown member (-1). An unresolvable CameraKey means the detector-type routing in the fact load regressed and camera events are being mis-attributed.',
+ N'SELECT COUNT(*) FROM fact.FactTrafficEvent f WHERE f.DateKey = @DateKey AND NOT EXISTS (SELECT 1 FROM dim.DimTrafficCamera d WHERE d.CameraKey = f.CameraKey)', 14),
+('DETECTOR_ROUTING_FTE', 'Integrity', 'fact.FactTrafficEvent', 'Error',
+ N'Exactly one asset dimension must resolve per detection: a SENSOR row needs a real SensorKey and CameraKey = -1, a CAMERA row the reverse. Both resolved (or neither) means a detection was counted against the wrong asset, double-counting sensor utilisation.',
+ N'SELECT COUNT(*) FROM fact.FactTrafficEvent f
+   WHERE f.DateKey = @DateKey
+     AND ((f.DetectorType = ''SENSOR'' AND f.CameraKey <> -1)
+       OR (f.DetectorType = ''CAMERA'' AND f.SensorKey <> -1))', 16),
 ('ORPHAN_FTE_VEHICLETYPE', 'Integrity', 'fact.FactTrafficEvent', 'Error',
  N'Vehicle-type lookups fall back to the unknown member (-1); any other unresolved value means the fallback logic regressed.',
  N'SELECT COUNT(*) FROM fact.FactTrafficEvent f WHERE f.DateKey = @DateKey AND NOT EXISTS (SELECT 1 FROM dim.DimVehicleType d WHERE d.VehicleTypeKey = f.VehicleTypeKey)', 14),
@@ -129,6 +156,9 @@ INSERT INTO etl.QualityCheckCatalog (CheckName, Category, TargetTable, Severity,
 ('DUP_CURRENT_DIMSENSOR', 'SCD', 'dim.DimSensor', 'Error',
  N'Same SCD2 single-current invariant as DimRoadSegment, for the sensor dimension.',
  N'SELECT COUNT(*) FROM (SELECT SerialNumber FROM dim.DimSensor WHERE IsCurrent = 1 AND SensorKey <> -1 GROUP BY SerialNumber HAVING COUNT(*) > 1) q', 42),
+('DUP_INTERSECTION_DIMTRAFFICLIGHT', 'Uniqueness', 'dim.DimTrafficLight', 'Error',
+ N'mart.vTrafficLightPerformance joins the controller to the hourly fact through the denormalized intersection NAME, because FactHourlyTraffic carries no TrafficLightKey. That join is only safe while one controller exists per intersection name: a second controller would make every fact row count once per controller and silently double ApproachVolume. This check turns that hidden assumption into an enforced invariant.',
+ N'SELECT COUNT(*) FROM (SELECT IntersectionName FROM dim.DimTrafficLight WHERE TrafficLightKey <> -1 GROUP BY IntersectionName HAVING COUNT(*) > 1) q', 44),
 ('DUP_FACT_TRAFFICEVENT', 'Uniqueness', 'fact.FactTrafficEvent', 'Error',
  N'The columnstore fact has no unique constraint by design (docs/09) — this check is the ONLY duplicate guard. A duplicated EventID means the batch delete-then-insert idempotency failed.',
  N'SELECT COUNT(*) FROM (SELECT EventID FROM fact.FactTrafficEvent WHERE DateKey = @DateKey GROUP BY EventID HAVING COUNT(*) > 1) q', 43);
@@ -153,7 +183,11 @@ INSERT INTO etl.QualityCheckCatalog (CheckName, Category, TargetTable, Severity,
  N'SELECT COUNT(*) FROM (SELECT SegmentCode FROM dim.DimRoadSegment WHERE RoadSegmentKey <> -1 GROUP BY SegmentCode HAVING SUM(CASE WHEN IsCurrent = 1 THEN 1 ELSE 0 END) = 0) q', 52),
 ('SCD2_NOCURRENT_DIMSENSOR', 'SCD', 'dim.DimSensor', 'Error',
  N'Same expire-without-reinsert failure mode as DimRoadSegment, for sensors.',
- N'SELECT COUNT(*) FROM (SELECT SerialNumber FROM dim.DimSensor WHERE SensorKey <> -1 GROUP BY SerialNumber HAVING SUM(CASE WHEN IsCurrent = 1 THEN 1 ELSE 0 END) = 0) q', 53);
+ N'SELECT COUNT(*) FROM (SELECT SerialNumber FROM dim.DimSensor WHERE SensorKey <> -1 GROUP BY SerialNumber HAVING SUM(CASE WHEN IsCurrent = 1 THEN 1 ELSE 0 END) = 0) q', 53),
+('SCD2_INVERTED_INTERVAL', 'SCD', 'dim.DimRoadSegment + dim.DimSensor', 'Error',
+ N'EffectiveDate must never exceed ExpirationDate. An inverted (zero-length) interval is invisible to SCD2_OVERLAP - inverted ranges overlap nothing - yet point-in-time fact lookups silently skip the version, so facts attach to the wrong attribute values with no error anywhere. Produced by expiring a row that became effective on the same load date, which happens when a date is reprocessed after the source changed again.',
+ N'SELECT (SELECT COUNT(*) FROM dim.DimRoadSegment WHERE RoadSegmentKey <> -1 AND EffectiveDate > ExpirationDate)
+        + (SELECT COUNT(*) FROM dim.DimSensor      WHERE SensorKey      <> -1 AND EffectiveDate > ExpirationDate)', 54);
 GO
 
 /* ============================================================================
@@ -179,6 +213,12 @@ INSERT INTO etl.QualityCheckCatalog (CheckName, Category, TargetTable, Severity,
 ('FUTURE_DATE_FTE', 'Validity', 'fact.FactTrafficEvent', 'Error',
  N'Future-dated events escaped both the silver FUTURE_TIMESTAMP rule and the staging DATE_MISMATCH rule — they inflate "today" dashboards with data that has not happened.',
  N'SELECT COUNT(*) FROM fact.FactTrafficEvent WHERE DateKey > CONVERT(INT, FORMAT(SYSUTCDATETIME(), ''yyyyMMdd''))', 64),
+/* Severity restored to Error (was temporarily downgraded to Warning).
+   The rule was never the problem: sql/oltp/03_sample_data.sql computed
+   RoadClearedAt and ClosedAt from INDEPENDENT offsets off DetectedAt, so some
+   incidents "closed" before the road was cleared. The generator now DERIVES
+   each milestone from its predecessor, making the invariant true by
+   construction — so the check can gate the pipeline again, as docs/14 says. */
 ('MILESTONE_ORDER_FIL', 'Validity', 'fact.FactIncidentLifecycle', 'Error',
  N'Accumulating-snapshot invariant: Detected <= Dispatched <= Arrived <= Cleared <= Closed for every populated milestone. Violations produce negative lags and nonsense SLA percentiles.',
  N'SELECT COUNT(*) FROM fact.FactIncidentLifecycle f
@@ -217,13 +257,38 @@ INSERT INTO etl.QualityCheckCatalog (CheckName, Category, TargetTable, Severity,
        + (CASE WHEN NOT EXISTS (SELECT 1 FROM dim.DimVehicleType      WHERE VehicleTypeKey   <> -1) THEN 1 ELSE 0 END)
        + (CASE WHEN NOT EXISTS (SELECT 1 FROM dim.DimWeatherCondition WHERE WeatherKey       <> -1) THEN 1 ELSE 0 END)', 71),
 ('SNAPSHOT_DENSITY_FHT', 'Completeness', 'fact.FactHourlyTraffic', 'Warning',
- N'Periodic-snapshot contract: current segments x 24 rows per loaded day, including zero-traffic hours. A mismatch usually means the current segment set changed after the load (new/retired business keys). Warning because it presumes the pipeline ran for @LoadDate.',
- N'SELECT ABS((SELECT COUNT(*) FROM dim.DimRoadSegment WHERE IsCurrent = 1 AND RoadSegmentKey <> -1) * 24
-            - (SELECT COUNT(*) FROM fact.FactHourlyTraffic WHERE DateKey = @DateKey))', 72),
+ N'Periodic-snapshot contract: current segments x 24 rows per loaded day, including zero-traffic hours. A mismatch usually means the current segment set changed after the load (new/retired business keys). Density is asserted only for dates that were ACTUALLY LOADED - a date with no fact rows was never fed (usp_LoadFactHourlyTraffic skips the spine rather than fabricating a phantom day), and demanding 2,880 rows for it would be a false alarm.',
+ N'SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM fact.FactHourlyTraffic WHERE DateKey = @DateKey) THEN 0
+          ELSE ABS((SELECT COUNT(*) FROM dim.DimRoadSegment WHERE IsCurrent = 1 AND RoadSegmentKey <> -1) * 24
+                 - (SELECT COUNT(*) FROM fact.FactHourlyTraffic WHERE DateKey = @DateKey)) END', 72),
+('PHANTOM_DAY_FHT', 'Completeness', 'fact.FactHourlyTraffic', 'Error',
+ N'A "phantom day" is a DateKey whose every row is zero traffic AND unknown weather - i.e. a whole calendar day fabricated by the density spine for a date that was never fed. It is not a zero-traffic HOUR (legitimate and the point of a dense snapshot); it is 2,880 rows of nothing that are indistinguishable from real data downstream, and they surface as an Unknown/0/NULL bucket in every weather and analytics view. Counts such days.',
+ N'SELECT COUNT(*) FROM (
+       SELECT DateKey FROM fact.FactHourlyTraffic
+       GROUP BY DateKey
+       HAVING SUM(VehicleCount) = 0
+          AND SUM(CASE WHEN WeatherKey <> -1 THEN 1 ELSE 0 END) = 0
+   ) q', 76),
 ('UNKNOWN_RATE_FTE', 'Completeness', 'fact.FactTrafficEvent', 'Warning',
- N'Rows keyed to Unknown members are legal (that is the -1 design) but each one is analytically blind; a spike signals upstream master-data gaps or a broken lookup. Monitoring signal, not a gate.',
+ N'Rows keyed to Unknown members are legal (that is the -1 design) but each one is analytically blind; a spike signals upstream master-data gaps or a broken lookup. Monitoring signal, not a gate. SensorKey/CameraKey are excluded because -1 there means "other detector technology", which is the normal case for half the rows.',
  N'SELECT COUNT(*) FROM fact.FactTrafficEvent
-   WHERE DateKey = @DateKey AND (RoadSegmentKey = -1 OR SensorKey = -1 OR VehicleTypeKey = -1 OR WeatherKey = -1)', 73);
+   WHERE DateKey = @DateKey AND (RoadSegmentKey = -1 OR VehicleTypeKey = -1 OR WeatherKey = -1)', 73),
+('MISSING_LOAD_DATE', 'Completeness', 'fact.FactHourlyTraffic', 'Warning',
+ N'A load date that was never processed leaves a hole no other check can see: every rule is scoped to the date it ran for, so a skipped night is simply never examined. Counts calendar days between the first and last successful batch that have no snapshot rows at all. Warning, because a deliberate gap (pipeline paused) is legitimate.',
+ N'SELECT COUNT(*) FROM (
+       SELECT d.DateKey
+       FROM dim.DimDate d
+       WHERE d.DateKey <> -1
+         AND d.FullDate BETWEEN (SELECT MIN(LoadDate) FROM etl.BatchLog WHERE Status = ''Succeeded'')
+                            AND (SELECT MAX(LoadDate) FROM etl.BatchLog WHERE Status = ''Succeeded'')
+         AND NOT EXISTS (SELECT 1 FROM fact.FactHourlyTraffic f WHERE f.DateKey = d.DateKey)
+   ) q', 74),
+('INFERRED_NEVER_COMPLETED', 'Completeness', 'dim.* (SCD2 dimensions)', 'Warning',
+ N'An inferred member is a promise that master data will arrive and complete it. One still flagged IsInferred = 1 after many batches means either the source system never registered the asset, or the fact feed is inventing business keys the master data will never recognise (the symptom that exposed camera codes being loaded as sensors). Counts skeletons older than 7 days.',
+ N'SELECT (SELECT COUNT(*) FROM dim.DimRoadSegment
+            WHERE IsInferred = 1 AND IsCurrent = 1 AND EffectiveDate < DATEADD(DAY, -7, @LoadDate))
+        + (SELECT COUNT(*) FROM dim.DimSensor
+            WHERE IsInferred = 1 AND IsCurrent = 1 AND EffectiveDate < DATEADD(DAY, -7, @LoadDate))', 75);
 GO
 
 /* ============================================================================
@@ -243,13 +308,13 @@ INSERT INTO etl.QualityCheckCatalog (CheckName, Category, TargetTable, Severity,
                  - (SELECT COUNT(*) FROM fact.FactTrafficEvent WHERE DateKey = @DateKey)
                  - (SELECT COUNT(*) FROM stg.RejectTrafficEvent WHERE ETLBatchID = @ETLBatchID)) END', 81),
 ('RECON_STG_FACT_HOURLY', 'Reconciliation', 'stg.HourlyTraffic -> fact.FactHourlyTraffic', 'Error',
- N'Every staged segment-hour aggregate must land in the snapshot (the spine only ADDS zero rows, never drops staged ones). A missing row means the reload quietly skipped data.',
+ N'Every staged segment-hour aggregate must land in the snapshot (the spine only ADDS zero rows, never drops staged ones). A missing row means the reload quietly skipped data. Matched through the BUSINESS KEY across all SCD2 versions: a historical date legitimately references the segment version that was current THEN, so resolving the business key to IsCurrent = 1 would report every re-versioned segment as missing data when nothing is missing at all.',
  N'SELECT COUNT(*) FROM stg.HourlyTraffic s
-   JOIN dim.DimRoadSegment d ON d.SegmentCode = s.SegmentCode AND d.IsCurrent = 1
    WHERE s.EventDate = @LoadDate
      AND NOT EXISTS (SELECT 1 FROM fact.FactHourlyTraffic f
+                     JOIN dim.DimRoadSegment d ON d.RoadSegmentKey = f.RoadSegmentKey
                      WHERE f.DateKey = @DateKey AND f.HourOfDay = s.HourOfDay
-                       AND f.RoadSegmentKey = d.RoadSegmentKey)', 82);
+                       AND d.SegmentCode = s.SegmentCode)', 82);
 GO
 
 /* ============================================================================

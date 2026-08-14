@@ -7,6 +7,14 @@
 USE TrafficDW;
 GO
 
+/* NOTE ON RE-RUNNING: every CREATE TABLE below is guarded so this file can be
+   deployed against an existing database without erroring on the second run -
+   the procedures already use CREATE OR ALTER. The guard has one consequence to
+   be aware of: it also means a CHANGED column definition will NOT be applied to
+   an existing table. Schema changes therefore require either an explicit ALTER
+   (see the Rationale column in 05_quality_checks.sql) or a fresh deploy, which
+   is what scripts/run_end_to_end.ps1 does by dropping both databases first. */
+
 /* ---------------- partitioning objects (monthly, RANGE RIGHT on DateKey) --- */
 IF NOT EXISTS (SELECT 1 FROM sys.partition_functions WHERE name = 'pfMonthlyDateKey')
 BEGIN
@@ -29,13 +37,22 @@ GO
    Grain: one row per individual vehicle detection by one sensor.
    Insert-only. Partitioned monthly by DateKey. Clustered columnstore (05).
    ========================================================================== */
+IF OBJECT_ID('fact.FactTrafficEvent') IS NULL
 CREATE TABLE fact.FactTrafficEvent (
     DateKey           INT          NOT NULL CONSTRAINT FK_FTE_Date        REFERENCES dim.DimDate(DateKey),
     TimeKey           SMALLINT     NOT NULL CONSTRAINT FK_FTE_Time        REFERENCES dim.DimTime(TimeKey),
     RoadSegmentKey    INT          NOT NULL CONSTRAINT FK_FTE_Segment     REFERENCES dim.DimRoadSegment(RoadSegmentKey),
+    /* Two ASSET dimensions, one per detector technology. A detection is made
+       by EITHER a loop/radar sensor OR an ANPR camera, so exactly one of these
+       resolves and the other takes the unknown member (-1). This is why both
+       are NOT NULL: "-1 = not applicable" is explicit, whereas NULL would make
+       every asset join an outer join. DetectorType records which one applies. */
     SensorKey         INT          NOT NULL CONSTRAINT FK_FTE_Sensor      REFERENCES dim.DimSensor(SensorKey),
+    CameraKey         INT          NOT NULL CONSTRAINT FK_FTE_Camera      REFERENCES dim.DimTrafficCamera(CameraKey),
     VehicleTypeKey    INT          NOT NULL CONSTRAINT FK_FTE_VehicleType REFERENCES dim.DimVehicleType(VehicleTypeKey),
     WeatherKey        INT          NOT NULL CONSTRAINT FK_FTE_Weather     REFERENCES dim.DimWeatherCondition(WeatherKey),
+    DetectorType      VARCHAR(10)  NOT NULL CONSTRAINT DF_FTE_DetType DEFAULT 'SENSOR'
+        CONSTRAINT CK_FTE_DetectorType CHECK (DetectorType IN ('SENSOR','CAMERA')),
     /* measures */
     SpeedKmh          DECIMAL(5,1) NULL,
     HeadwaySeconds    DECIMAL(6,2) NULL,
@@ -52,6 +69,7 @@ GO
    Grain: one row per road segment per clock hour (rows exist for zero traffic).
    Replaced per load date (delete + insert). Rowstore clustered + NCCI (05).
    ========================================================================== */
+IF OBJECT_ID('fact.FactHourlyTraffic') IS NULL
 CREATE TABLE fact.FactHourlyTraffic (
     DateKey            INT          NOT NULL CONSTRAINT FK_FHT_Date    REFERENCES dim.DimDate(DateKey),
     HourOfDay          TINYINT      NOT NULL,          -- 0..23 (hour spine, not DimTime minute grain)
@@ -83,6 +101,7 @@ GO
    Unreached milestones point at the Unknown member (-1), NOT NULL —
    this keeps joins simple and makes 'not yet' explicit.
    ========================================================================== */
+IF OBJECT_ID('fact.FactIncidentLifecycle') IS NULL
 CREATE TABLE fact.FactIncidentLifecycle (
     IncidentKey          INT IDENTITY(1,1) CONSTRAINT PK_FactIncidentLifecycle PRIMARY KEY CLUSTERED,
     IncidentNumber       VARCHAR(20) NOT NULL,          -- degenerate dimension (source BK)

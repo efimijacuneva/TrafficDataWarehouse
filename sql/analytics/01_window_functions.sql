@@ -33,14 +33,23 @@ GO
    Q2. "Rank roads by average congestion — and show how ties behave."
        RANK vs DENSE_RANK side by side.
    ========================================================================== */
+/* CongestionIndex on the hourly snapshot is ALREADY an average over the
+   vehicles seen in that hour, so rolling it up must be VOLUME-WEIGHTED —
+   the same rule stated in sql/warehouse/06_mart_views.sql. A plain
+   AVG(CongestionIndex) would weight an empty 03:00 hour exactly like the
+   08:00 peak and quietly overstate congestion on low-traffic roads. */
 SELECT s.RoadName,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3))                       AS AvgCongestion,
-       RANK()       OVER (ORDER BY AVG(f.CongestionIndex) DESC)           AS RankWithGaps,
-       DENSE_RANK() OVER (ORDER BY AVG(f.CongestionIndex) DESC)           AS RankNoGaps
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3))             AS AvgCongestion,
+       RANK()       OVER (ORDER BY SUM(f.CongestionIndex * f.VehicleCount)
+                                   / NULLIF(SUM(f.VehicleCount), 0) DESC) AS RankWithGaps,
+       DENSE_RANK() OVER (ORDER BY SUM(f.CongestionIndex * f.VehicleCount)
+                                   / NULLIF(SUM(f.VehicleCount), 0) DESC) AS RankNoGaps
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
 WHERE f.CongestionIndex IS NOT NULL
 GROUP BY s.RoadName
+HAVING SUM(f.VehicleCount) > 0
 ORDER BY AvgCongestion DESC;
 GO
 
@@ -50,12 +59,15 @@ GO
        NTILE.
    ========================================================================== */
 SELECT s.SegmentCode, s.RoadName, s.District,
-       CAST(AVG(f.CongestionIndex) AS DECIMAL(4,3)) AS AvgCongestion,
-       NTILE(4) OVER (ORDER BY AVG(f.CongestionIndex) DESC) AS CongestionQuartile
+       CAST(SUM(f.CongestionIndex * f.VehicleCount)
+            / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion,
+       NTILE(4) OVER (ORDER BY SUM(f.CongestionIndex * f.VehicleCount)
+                               / NULLIF(SUM(f.VehicleCount), 0) DESC) AS CongestionQuartile
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
 WHERE f.CongestionIndex IS NOT NULL
-GROUP BY s.SegmentCode, s.RoadName, s.District;
+GROUP BY s.SegmentCode, s.RoadName, s.District
+HAVING SUM(f.VehicleCount) > 0;
 GO
 
 /* ============================================================================
@@ -78,7 +90,8 @@ SELECT d.FullDate, f.HourOfDay, s.SegmentCode,
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimDate d        ON d.DateKey = f.DateKey
 JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
-WHERE d.FullDate = '2026-06-15'
+WHERE d.FullDate = (SELECT MAX(FullDate) FROM dim.DimDate d2
+                    JOIN fact.FactHourlyTraffic f2 ON f2.DateKey = d2.DateKey)  -- latest LOADED day, never empty
 ORDER BY s.SegmentCode, f.HourOfDay;
 GO
 
@@ -134,6 +147,42 @@ SELECT DISTINCT
 FROM fact.FactIncidentLifecycle f
 JOIN dim.DimIncidentType it ON it.IncidentTypeKey = f.IncidentTypeKey
 WHERE f.MinutesToArrive IS NOT NULL;
+GO
+
+/* ============================================================================
+   Q7b. "How long does a segment stay clear between incidents, and which
+         segment is about to become a repeat-offender?"
+        LEAD — the forward-looking counterpart of LAG in Q6.
+
+   LAG answers "what came before this row"; LEAD answers "what comes after".
+   Here the gap to the NEXT incident on the same segment is the measure the
+   road-safety board actually wants: a segment whose incidents cluster hours
+   apart is behaving differently from one with a steady low rate, even when
+   both have the same monthly total. Computing it with LEAD is one ordered
+   pass; the self-join alternative ("the earliest incident later than this
+   one") is a correlated subquery per row.
+   ========================================================================== */
+SELECT s.SegmentCode,
+       s.RoadName,
+       f.IncidentNumber,
+       dd.FullDate                                   AS DetectedDate,
+       t.TimeBK                                      AS DetectedTime,
+       LEAD(dd.FullDate) OVER (PARTITION BY f.RoadSegmentKey
+                               ORDER BY f.DetectedDateKey, f.DetectedTimeKey)
+                                                     AS NextIncidentDate,
+       /* minutes until the next incident on this same segment */
+       DATEDIFF(MINUTE,
+           DATEADD(MINUTE, f.DetectedTimeKey, CAST(dd.FullDate AS DATETIME2(0))),
+           LEAD(DATEADD(MINUTE, f.DetectedTimeKey, CAST(dd.FullDate AS DATETIME2(0))))
+                OVER (PARTITION BY f.RoadSegmentKey
+                      ORDER BY f.DetectedDateKey, f.DetectedTimeKey))
+                                                     AS MinutesToNextIncident
+FROM fact.FactIncidentLifecycle f
+JOIN dim.DimRoadSegment s ON s.RoadSegmentKey = f.RoadSegmentKey
+JOIN dim.DimDate dd       ON dd.DateKey = f.DetectedDateKey
+JOIN dim.DimTime t        ON t.TimeKey  = f.DetectedTimeKey
+WHERE f.DetectedDateKey <> -1
+ORDER BY s.SegmentCode, f.DetectedDateKey, f.DetectedTimeKey;
 GO
 
 /* ============================================================================

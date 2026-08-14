@@ -25,6 +25,10 @@ FROM dim.DimRoadSegment WHERE IsCurrent = 1 AND RoadSegmentKey <> -1;
 GO
 
 /* --------------------------------------------- R01 Top busiest roads ------ */
+/* NOTE ON ORDERING: SQL Server does not guarantee row order from a view. The
+   ORDER BY below only determines WHICH rows TOP keeps - it does not make the
+   view's output sorted. Consumers must apply their own ORDER BY; the report
+   catalogue and the Power BI model both do. */
 CREATE OR ALTER VIEW mart.vTopBusiestRoads AS
 SELECT TOP (10) WITH TIES
        s.RoadName, s.RoadCategory,
@@ -119,7 +123,26 @@ JOIN dim.DimVehicleType vt ON vt.VehicleTypeKey = f.VehicleTypeKey
 GROUP BY vt.Category, vt.TypeName;
 GO
 
-/* --------------------------------------- R08 Traffic by weather ----------- */
+/* --------------------------------------- R08 Traffic by weather -----------
+   SCOPED TO HOURS THAT ACTUALLY RECORDED TRAFFIC.
+
+   The snapshot is dense on purpose: a segment-hour with no vehicles still gets
+   a row, which is what makes "which segments were empty at 03:00" answerable.
+   Such an hour has no observation to band, so it correctly carries the Unknown
+   weather member (-1).
+
+   Those rows must not form a GROUP in a weather report. Rolled up they produced
+   a permanent 'Unknown | 0 vehicles | NULL speed' bucket - ~1,470 zero-traffic
+   hours across a 7-day load - which rendered as an empty bar in the dashboard's
+   "average speed by weather" chart and told the reader nothing about weather.
+   The measures already exclude them arithmetically (volume-weighting multiplies
+   by VehicleCount = 0), so the group contributed nothing but noise.
+
+   This is NOT hiding the unknown member. If an hour ever records traffic AND
+   fails to resolve weather, it still appears here - and that is a genuine
+   defect, which the ORPHAN_FTE_WEATHER check and the "weather resolves on every
+   hour that has traffic" invariant in tests/sql/test_warehouse_invariants.sql
+   both assert against independently.                                          */
 CREATE OR ALTER VIEW mart.vTrafficByWeather AS
 SELECT w.ConditionName, w.PrecipBand, w.IsSevere,
        SUM(f.VehicleCount)                          AS TotalVehicles,
@@ -129,6 +152,7 @@ SELECT w.ConditionName, w.PrecipBand, w.IsSevere,
             / NULLIF(SUM(f.VehicleCount), 0) AS DECIMAL(4,3)) AS AvgCongestion
 FROM fact.FactHourlyTraffic f
 JOIN dim.DimWeatherCondition w ON w.WeatherKey = f.WeatherKey
+WHERE f.VehicleCount > 0        -- weather describes traffic, not its absence
 GROUP BY w.ConditionName, w.PrecipBand, w.IsSevere;
 GO
 
@@ -160,6 +184,16 @@ GO
 /* ------------------------------ R11 Traffic-light performance ------------- */
 /* Throughput at signalized end-intersections vs. the controller's plan;
    PreviousTimingPlan (SCD3) enables before/after comparison in one row.    */
+/* GRAIN / JOIN CAVEAT: FactHourlyTraffic has no TrafficLightKey - the bus
+   matrix deliberately conforms only Date, RoadSegment and Weather onto the
+   hourly snapshot - so this report reaches the controller through the
+   DENORMALIZED intersection NAME on DimRoadSegment. That is a legitimate
+   report-layer join, not a conformed relationship, and it carries one risk:
+   if two controllers ever shared an intersection name, every fact row would be
+   counted once per controller and ApproachVolume would silently double.
+   Rather than restructure the star for one report, the invariant is ENFORCED
+   as a gated quality check (DUP_INTERSECTION_DIMTRAFFICLIGHT,
+   sql/etl/05_quality_checks.sql) so the fan-out cannot happen unnoticed. */
 CREATE OR ALTER VIEW mart.vTrafficLightPerformance AS
 SELECT tl.ControllerCode, tl.IntersectionName,
        tl.CurrentTimingPlan, tl.PreviousTimingPlan, tl.TimingPlanChangeDate,
@@ -196,6 +230,10 @@ GROUP BY dd.YearMonth, it.Category, eu.UnitType;
 GO
 
 /* ------------------------------- R13 Top congested intersections ---------- */
+/* NOTE ON ORDERING: SQL Server does not guarantee row order from a view. The
+   ORDER BY below only determines WHICH rows TOP keeps - it does not make the
+   view's output sorted. Consumers must apply their own ORDER BY; the report
+   catalogue and the Power BI model both do. */
 CREATE OR ALTER VIEW mart.vTopCongestedIntersections AS
 SELECT TOP (10) WITH TIES
        s.EndIntersection                                AS Intersection,

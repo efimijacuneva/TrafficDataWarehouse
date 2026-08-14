@@ -185,36 +185,62 @@ INSERT INTO oltp.IncidentType (TypeCode, TypeName, Category, DefaultSeverity) VA
  ('SIGN', N'Signal Malfunction',       'Hazard',     3),
  ('EVNT', N'Public Event Closure',     'Event',      2);
 
-/* 180 incidents over June 2026, in every lifecycle stage */
-;WITH n AS (SELECT TOP (180) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
+/* 180 incidents over June 2026, in every lifecycle stage.
+
+   MILESTONE MONOTONICITY IS A HARD INVARIANT of the accumulating-snapshot fact:
+       Detected <= Dispatched <= Arrived <= RoadCleared <= Closed
+   Every milestone below is therefore DERIVED FROM ITS PREDECESSOR (offset added
+   to the previous milestone) instead of being computed independently from
+   DetectedAt. Independent offsets were the earlier defect: RoadClearedAt used
+   (25 + i%90) minutes and ClosedAt used (45 + i%120), so for e.g. incident 120
+   the road cleared at +55 min but the incident "closed" at +45 min — before it
+   was cleared. That produced permanent failures of the MILESTONE_ORDER_FIL
+   quality check (sql/etl/05_quality_checks.sql).
+   Deliberate DATA-QUALITY defects belong in the file feeds, not in the OLTP
+   system of record — see data_generator/generate_data.py.                     */
+;WITH n AS (SELECT TOP (180) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects),
+ m AS (
+    SELECT n.i,
+           DATEADD(MINUTE, (n.i * 227) % 43200, '2026-06-01')       AS DetectedAt,
+           /* clearance happens 25..114 min AFTER detection                */
+           25 + n.i % 90                                            AS ClearOffsetMin,
+           /* closure happens a further 20..79 min AFTER clearance        */
+           20 + n.i % 60                                            AS CloseOffsetMin
+    FROM n
+ )
 INSERT INTO oltp.Incident
       (IncidentNumber, IncidentTypeID, RoadSegmentID, DetectedAt, Severity, LanesBlocked, Description, Status, RoadClearedAt, ClosedAt)
-SELECT CONCAT('INC-2026-', RIGHT('00000' + CAST(n.i AS VARCHAR(5)), 5)),
-       1 + (n.i % 9),
-       1 + (n.i * 7 % 120),
-       DATEADD(MINUTE, (n.i * 227) % 43200, '2026-06-01'),        -- spread over 30 days
-       1 + ((n.i * 3) % 5),
-       n.i % 3,
-       CONCAT(N'Auto-generated incident #', n.i),
-       CASE WHEN n.i % 10 = 0 THEN 'Detected'
-            WHEN n.i % 10 = 1 THEN 'Responded'
-            WHEN n.i % 10 = 2 THEN 'Cleared'
+SELECT CONCAT('INC-2026-', RIGHT('00000' + CAST(m.i AS VARCHAR(5)), 5)),
+       1 + (m.i % 9),
+       1 + (m.i * 7 % 120),
+       m.DetectedAt,                                                -- spread over 30 days
+       1 + ((m.i * 3) % 5),
+       m.i % 3,
+       CONCAT(N'Auto-generated incident #', m.i),
+       CASE WHEN m.i % 10 = 0 THEN 'Detected'
+            WHEN m.i % 10 = 1 THEN 'Responded'
+            WHEN m.i % 10 = 2 THEN 'Cleared'
             ELSE 'Closed' END,
-       CASE WHEN n.i % 10 IN (0,1) THEN NULL
-            ELSE DATEADD(MINUTE, (n.i * 227) % 43200 + 25 + n.i % 90, '2026-06-01') END,
-       CASE WHEN n.i % 10 IN (0,1,2) THEN NULL
-            ELSE DATEADD(MINUTE, (n.i * 227) % 43200 + 45 + n.i % 120, '2026-06-01') END
-FROM n;
+       CASE WHEN m.i % 10 IN (0,1) THEN NULL
+            ELSE DATEADD(MINUTE, m.ClearOffsetMin, m.DetectedAt) END,
+       CASE WHEN m.i % 10 IN (0,1,2) THEN NULL
+            ELSE DATEADD(MINUTE, m.ClearOffsetMin + m.CloseOffsetMin, m.DetectedAt) END
+FROM m;
 
-/* police responses for all non-'Detected' incidents */
+/* Police responses for all non-'Detected' incidents.
+   Same monotonicity rule: ArrivedAt is derived FROM DispatchedAt, so
+   CK_Response_Order (ArrivedAt >= DispatchedAt) holds by construction, and the
+   maximum arrival offset (7 + 16 = 23 min) stays below the minimum clearance
+   offset (25 min) so Arrived <= RoadCleared always holds too.                */
 INSERT INTO oltp.PoliceResponse (IncidentID, EmergencyVehicleID, DispatchedAt, ArrivedAt, ClearedAt)
 SELECT i.IncidentID,
        1 + (i.IncidentID % 40),
-       DATEADD(MINUTE, 2 + i.IncidentID % 6,  i.DetectedAt),
+       d.DispatchedAt,
        CASE WHEN i.Status IN ('Responded','Cleared','Closed')
-            THEN DATEADD(MINUTE, 6 + i.IncidentID % 14, i.DetectedAt) END,
+            THEN DATEADD(MINUTE, 4 + i.IncidentID % 13, d.DispatchedAt) END,
        CASE WHEN i.Status IN ('Cleared','Closed') THEN i.RoadClearedAt END
 FROM oltp.Incident i
+CROSS APPLY (SELECT DATEADD(MINUTE, 2 + i.IncidentID % 6, i.DetectedAt) AS DispatchedAt) d
 WHERE i.Status <> 'Detected';
 
 /* ---------------------------------------------------------------- maintenance */

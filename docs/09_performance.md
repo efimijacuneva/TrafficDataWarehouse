@@ -26,9 +26,11 @@ segments with metadata, optimized for scans of millions of rows, not seeks of on
 - Partition-aligned CCI enables per-partition rebuilds.
 
 ### Statistics
-Auto-create/auto-update on; after each nightly load the ETL runs `UPDATE STATISTICS` on
-touched facts (incremental stats per partition) — ascending-date facts are the textbook
-case of stale-stats misestimates on "yesterday" predicates.
+Auto-create/auto-update on; after each nightly load the ETL runs `UPDATE STATISTICS ...
+WITH RESAMPLE` on the three facts (`etl.usp_UpdateFactStatistics`) — ascending-date facts
+are the textbook case of stale-stats misestimates on "yesterday" predicates. Note this is a
+full-object resample, **not** partition-incremental statistics; `WITH RESAMPLE, INCREMENTAL = ON`
+would be the next step at production volume.
 
 ### Other
 - `mart` views pre-join facts to dims → consistent semantics + plan reuse.
@@ -40,11 +42,11 @@ case of stale-stats misestimates on "yesterday" predicates.
 
 | Technique | Where used | Effect |
 |---|---|---|
-| **Broadcast join** | Segment/station lookups in jobs 03/05 (`broadcast(dim_df)`) | Eliminates shuffle of the 80M-row side entirely; small table shipped to every executor |
+| **Broadcast join** | Hourly weather aggregate in job 03 (`broadcast(weather_hourly)`) | <=24 rows/day vs hundreds of thousands of detections: the small side ships to every executor and the large side is never shuffled. The only broadcast in the pipeline — job 05 performs no join at all |
 | **Shuffle tuning** | `spark.sql.shuffle.partitions` sized ≈ input-partitions; **AQE on** (`adaptive.enabled`, `coalescePartitions`, `skewJoin`) | No 200-empty-task default; skewed segment hot-spots split automatically |
 | **Caching** | `df.cache()` on the cleaned detections DF in job 03 — reused by the hourly aggregation and the event-grain gold write | Avoids re-reading/re-validating silver per consumer; unpersisted after use |
 | **Partition-aware writes** | `repartition("event_date")` + `partitionOverwriteMode=dynamic` | Few large files, idempotent day-level reruns |
-| **Explicit schemas** | all readers | Skips inference pass; stable types |
+| **Explicit schemas** | the high-volume sensor CSV (`StructType` + `_corrupt_record`) | Skips the inference pass and stabilises types where it matters. The small JSON feeds are read schema-on-read, which is the right trade at their size |
 | **Parquet pushdown/pruning** | all readers | See doc 08 |
 | **Kryo serialization** | `config/spark_config.py` | Cheaper serialization in shuffles/caches |
 

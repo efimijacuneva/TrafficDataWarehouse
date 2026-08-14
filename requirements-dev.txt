@@ -1,0 +1,14 @@
+# Development / demo extras. The core pipeline needs only requirements.txt.
+#   pip install -r requirements-dev.txt
+
+# --- tests -------------------------------------------------------------------
+pytest==8.3.3
+# Spark tests additionally need a JDK 11/17 on PATH; without one they SKIP with
+# an explicit "NOT VERIFIED" reason rather than passing silently.
+
+# --- dashboard ---------------------------------------------------------------
+streamlit==1.39.0
+plotly==5.24.1
+pandas==2.2.2
+pyarrow==17.0.0        # reads the gold/silver Parquet zones without Spark
+pyodbc==5.2.0          # reads the warehouse; optional - the app degrades gracefully

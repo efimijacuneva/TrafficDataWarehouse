@@ -20,28 +20,55 @@ BEGIN
     SET NOCOUNT ON;
     DECLARE @seg INT, @sns INT;
 
+    ;WITH segment_src AS (
+        SELECT s.SegmentCode,
+               ROW_NUMBER() OVER (PARTITION BY s.SegmentCode ORDER BY s.SegmentCode) AS rn
+        FROM stg.TrafficEvent s
+        WHERE s.SegmentCode IS NOT NULL
+    ),
+    segment_dedup AS (
+        SELECT SegmentCode
+        FROM segment_src
+        WHERE rn = 1
+    )
     INSERT INTO dim.DimRoadSegment (SegmentCode, RoadCode, RoadName, RoadCategory, City, District,
             Direction, StartIntersection, EndIntersection, LengthM, LaneCount,
             SpeedLimitKmh, CurrentSpeedLimitKmh, OriginalSpeedLimitKmh,
             EffectiveDate, ExpirationDate, IsCurrent, VersionNumber, IsInferred, HashDiff, ETLBatchID)
-    SELECT DISTINCT s.SegmentCode, 'UNKNOWN', N'Inferred (awaiting master data)', 'Local',
+    SELECT s.SegmentCode, 'UNKNOWN', N'Inferred (awaiting master data)', 'Local',
             N'Unknown', N'Unknown', 'NB', N'Unknown', N'Unknown', 0, 1,
             50, 50, 50, @LoadDate, '9999-12-31', 1, 1, 1, 0x0, @ETLBatchID
-    FROM stg.TrafficEvent s
-    WHERE s.SegmentCode IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM dim.DimRoadSegment d
+    FROM segment_dedup s
+    WHERE NOT EXISTS (SELECT 1 FROM dim.DimRoadSegment d
                       WHERE d.SegmentCode = s.SegmentCode AND d.IsCurrent = 1);
     SET @seg = @@ROWCOUNT;
 
+    /* Only SENSOR-sourced rows may create inferred DimSensor members.
+       Camera detections carry CameraCode and resolve against DimTrafficCamera;
+       inferring them as sensors (the earlier behaviour, when camera_code was
+       aliased into sensor_serial) created skeleton "sensors" that no master
+       data could ever complete, so IsInferred stayed 1 forever. */
+    ;WITH sensor_src AS (
+        SELECT s.SensorSerial,
+               ISNULL(s.SegmentCode,'UNKNOWN') AS SegmentCode,
+               ROW_NUMBER() OVER (PARTITION BY s.SensorSerial ORDER BY s.SensorSerial) AS rn
+        FROM stg.TrafficEvent s
+        WHERE s.SensorSerial IS NOT NULL
+          AND ISNULL(s.DetectorType, 'SENSOR') = 'SENSOR'
+    ),
+    sensor_dedup AS (
+        SELECT SensorSerial, SegmentCode
+        FROM sensor_src
+        WHERE rn = 1
+    )
     INSERT INTO dim.DimSensor (SerialNumber, SensorTypeName, Technology, SegmentCode, StatusClass,
             InstallDate, FirmwareVersion, EffectiveDate, ExpirationDate,
             IsCurrent, VersionNumber, IsInferred, HashDiff, ETLBatchID)
-    SELECT DISTINCT s.SensorSerial, N'Inferred', N'Unknown', ISNULL(s.SegmentCode,'UNKNOWN'), 'Unknown',
+    SELECT d.SensorSerial, N'Inferred', N'Unknown', d.SegmentCode, 'Unknown',
             NULL, NULL, @LoadDate, '9999-12-31', 1, 1, 1, 0x0, @ETLBatchID
-    FROM stg.TrafficEvent s
-    WHERE s.SensorSerial IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM dim.DimSensor d
-                      WHERE d.SerialNumber = s.SensorSerial AND d.IsCurrent = 1);
+    FROM sensor_dedup d
+    WHERE NOT EXISTS (SELECT 1 FROM dim.DimSensor existing
+                      WHERE existing.SerialNumber = d.SensorSerial AND existing.IsCurrent = 1);
     SET @sns = @@ROWCOUNT;
 
     INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsInserted)
@@ -69,8 +96,19 @@ BEGIN
 
         BEGIN TRAN;
 
-        /* ---------- idempotency: wipe any previous load of this date ---------- */
+        /* ---------- idempotency: wipe any previous load of this date ----------
+           The quarantine must be wiped by DATE too, not just the fact. It is
+           append-only otherwise, so re-running a date left the previous run's
+           rejects in place under an older ETLBatchID: batch-scoped checks stayed
+           correct, but etl.usp_ExecutionSummary and mart.vPbiRejectDaily
+           double-counted rejects on every rerun. Deleting by the event date the
+           rejects belong to keeps "rows rejected for 2026-06-01" a single
+           truthful number however many times the date is reprocessed. */
         DELETE FROM fact.FactTrafficEvent WHERE DateKey = @DateKey;
+        DELETE FROM stg.RejectTrafficEvent
+        WHERE CAST(EventTimestamp AS DATE) = @LoadDate
+           OR (EventTimestamp IS NULL AND ETLBatchID IN
+               (SELECT ETLBatchID FROM etl.BatchLog WHERE LoadDate = @LoadDate));
 
         /* ---------- cleanse + dedup + validate into a temp shape -------------- */
         ;WITH dedup AS (
@@ -97,30 +135,34 @@ BEGIN
 
         /* rn > 1 duplicates are counted as rejected (reason DUPLICATE) */
         INSERT INTO stg.RejectTrafficEvent (ETLBatchID, RejectReason, EventID, EventTimestamp, SensorSerial, SegmentCode, RawPayload)
-        SELECT @ETLBatchID, 'DUPLICATE', s.EventID, s.EventTimestamp, s.SensorSerial, s.SegmentCode, NULL
+        SELECT @ETLBatchID, 'DUPLICATE', s.EventID, s.EventTimestamp,
+               COALESCE(s.SensorSerial, s.CameraCode), s.SegmentCode, NULL
         FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY EventID ORDER BY EventTimestamp DESC) rn
               FROM stg.TrafficEvent WHERE LoadDate = @LoadDate) s
         WHERE s.rn > 1;
         SET @rejected = @@ROWCOUNT;
 
         INSERT INTO stg.RejectTrafficEvent (ETLBatchID, RejectReason, EventID, EventTimestamp, SensorSerial, SegmentCode, RawPayload)
-        SELECT @ETLBatchID, e.RejectReason, e.EventID, e.EventTimestamp, e.SensorSerial, e.SegmentCode,
-               CONCAT('speed=', e.SpeedKmh, ';occ=', e.OccupancyPct)
+        SELECT @ETLBatchID, e.RejectReason, e.EventID, e.EventTimestamp,
+               COALESCE(e.SensorSerial, e.CameraCode), e.SegmentCode,
+               CONCAT('detector=', ISNULL(e.DetectorType,'?'), ';speed=', e.SpeedKmh, ';occ=', e.OccupancyPct)
         FROM #events e
         WHERE e.RejectReason IS NOT NULL;
         SET @rejected = @rejected + @@ROWCOUNT;
 
         /* ---------- surrogate-key pipeline + insert --------------------------- */
         INSERT INTO fact.FactTrafficEvent
-              (DateKey, TimeKey, RoadSegmentKey, SensorKey, VehicleTypeKey, WeatherKey,
-               SpeedKmh, HeadwaySeconds, OccupancyPct, SpeedOverLimitKmh, EventID, ETLBatchID)
+              (DateKey, TimeKey, RoadSegmentKey, SensorKey, CameraKey, VehicleTypeKey, WeatherKey,
+               DetectorType, SpeedKmh, HeadwaySeconds, OccupancyPct, SpeedOverLimitKmh, EventID, ETLBatchID)
         SELECT
             @DateKey,
             DATEPART(HOUR, e.EventTimestamp) * 60 + DATEPART(MINUTE, e.EventTimestamp),
             ISNULL(seg.RoadSegmentKey, -1),                    -- unknown member fallback
-            ISNULL(sns.SensorKey, -1),
+            ISNULL(sns.SensorKey, -1),                         -- -1 for camera detections
+            ISNULL(cam.CameraKey, -1),                         -- -1 for sensor detections
             ISNULL(vt.VehicleTypeKey, -1),
             ISNULL(w.WeatherKey, -1),
+            ISNULL(e.DetectorType, 'SENSOR'),
             e.SpeedKmh,
             e.HeadwaySeconds,
             e.OccupancyPct,
@@ -137,6 +179,11 @@ BEGIN
         LEFT JOIN dim.DimSensor sns
                ON sns.SerialNumber = e.SensorSerial
               AND @LoadDate >= sns.EffectiveDate AND @LoadDate <= sns.ExpirationDate
+        /* DimTrafficCamera is SCD 1, so no validity predicate — there is only
+           ever one row per CameraCode. Resolves only for DetectorType='CAMERA'
+           rows; sensor rows have CameraCode NULL and fall back to -1. */
+        LEFT JOIN dim.DimTrafficCamera cam
+               ON cam.CameraCode = e.CameraCode
         LEFT JOIN dim.DimVehicleType vt
                ON vt.TypeCode = e.VehicleTypeCode
         LEFT JOIN dim.DimWeatherCondition w
@@ -185,6 +232,37 @@ BEGIN
             spine carries new RoadSegmentKeys, so old-version rows would never
             match and would survive as duplicates of the same segment-hour) */
         DELETE FROM fact.FactHourlyTraffic WHERE DateKey = @DateKey;
+
+        /* ---------- DENSITY IS PER LOADED DAY, NOT PER CALENDAR DAY ----------
+           The spine guarantees a row for every segment-hour so that ABSENCE is
+           measurable: "which segments were empty at 03:00" is a real question
+           and only a dense snapshot can answer it.
+
+           That contract applies WITHIN a day that was actually fed. It does not
+           license fabricating an ENTIRE day that has no source data at all.
+           Running the pipeline for a date beyond the feed - which
+           scripts/run_scd2_demo.ps1 legitimately does, because a new SCD2
+           version needs a load date later than the last one - used to insert
+           2,880 rows of pure zeros keyed to the Unknown weather member. Those
+           rows are indistinguishable from real zero-traffic hours downstream,
+           so they surfaced as an 'Unknown / 0 vehicles / NULL speed' bucket in
+           mart.vTrafficByWeather and every other analytics view, and a second
+           phantom day was added on every demo run.
+
+           A day with no staged aggregates is a day that was never fed, so there
+           is nothing to snapshot. The DELETE above still runs, so re-running a
+           date cleans up any phantom rows a previous version created. */
+        IF NOT EXISTS (SELECT 1 FROM stg.HourlyTraffic WHERE EventDate = @LoadDate)
+        BEGIN
+            INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted, RowsInserted)
+            VALUES (@ETLBatchID, 'Fact.HourlyTraffic', 0, 0);
+
+            COMMIT;
+            PRINT CONCAT('Fact.HourlyTraffic: no staged aggregates for ',
+                         CONVERT(CHAR(10), @LoadDate, 120),
+                         ' - snapshot skipped (nothing was fed for this date).');
+            RETURN;
+        END
 
         /* spine: every current segment × 24 hours → density guaranteed */
         ;WITH hours AS (

@@ -85,7 +85,14 @@ GO
    ========================================================================== */
 USE TrafficDW;
 GO
-DECLARE @From DATE = '2026-06-01', @To DATE = '2026-06-30';
+/* Bound the spine by what the pipeline actually claims to have loaded, rather
+   than a hard-coded month: a fixed 30-day window against a 7-day load reports
+   23 "missing" dates that were never supposed to exist, which reads like 23
+   pipeline failures. Between the first and last SUCCEEDED batch, a date with
+   no facts is a genuine gap. */
+DECLARE @From DATE = (SELECT MIN(LoadDate) FROM etl.BatchLog WHERE Status = 'Succeeded');
+DECLARE @To   DATE = (SELECT MAX(LoadDate) FROM etl.BatchLog WHERE Status = 'Succeeded');
+IF @From IS NULL BEGIN PRINT 'No successful batches yet - nothing to gap-check.'; RETURN; END
 
 WITH date_spine AS (
     SELECT @From AS D

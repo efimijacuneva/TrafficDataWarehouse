@@ -226,14 +226,43 @@ BEGIN
         JOIN   #src src ON src.SegmentCode = tgt.SegmentCode
         WHERE  tgt.IsCurrent = 1 AND tgt.IsInferred = 1;
 
+        /* SAME-DAY RE-VERSION = in-place correction, not a new version.
+           If the current row already became effective ON @LoadDate (the date is
+           being reprocessed and the source changed again since), expiring it
+           would set ExpirationDate = @LoadDate - 1 while EffectiveDate is
+           @LoadDate: an inverted, zero-length validity interval. Point-in-time
+           lookups silently skip such a row, and SCD2_OVERLAP cannot see it
+           because inverted intervals do not overlap anything.
+           A version that never survived a full day has no history worth
+           preserving, so it is overwritten Type-1 style. Runs before the MERGE
+           for the same reason as the inferred-completion above: T-SQL allows a
+           single WHEN MATCHED UPDATE branch. */
+        UPDATE tgt
+        SET    RoadCode = src.RoadCode, RoadName = src.RoadName,
+               RoadCategory = src.RoadCategory, City = src.City, District = src.District,
+               Direction = src.Direction,
+               StartIntersection = src.StartIntersection, EndIntersection = src.EndIntersection,
+               Latitude = src.Latitude, Longitude = src.Longitude,
+               LengthM = src.LengthM, LaneCount = src.LaneCount,
+               SpeedLimitKmh = src.SpeedLimitKmh,
+               CurrentSpeedLimitKmh = src.SpeedLimitKmh,
+               HashDiff = src.HashDiff, ETLBatchID = @ETLBatchID
+               /* OriginalSpeedLimitKmh deliberately untouched — Type 0 */
+        FROM   dim.DimRoadSegment tgt
+        JOIN   #src src ON src.SegmentCode = tgt.SegmentCode
+        WHERE  tgt.IsCurrent = 1
+          AND  tgt.EffectiveDate >= @LoadDate      -- created today, correct in place
+          AND  tgt.HashDiff <> src.HashDiff;
+
         DECLARE @actions TABLE (MergeAction NVARCHAR(10), SegmentCode VARCHAR(30),
                                 OldVersion INT, OldOriginalLimit SMALLINT);
 
         MERGE dim.DimRoadSegment AS tgt
         USING #src AS src
            ON tgt.SegmentCode = src.SegmentCode AND tgt.IsCurrent = 1
-        /* genuine change: expire the current version */
-        WHEN MATCHED AND tgt.HashDiff <> src.HashDiff THEN
+        /* genuine change on a row that predates this load: expire it.
+           EffectiveDate < @LoadDate is what keeps the new interval valid. */
+        WHEN MATCHED AND tgt.HashDiff <> src.HashDiff AND tgt.EffectiveDate < @LoadDate THEN
             UPDATE SET IsCurrent = 0,
                        ExpirationDate = DATEADD(DAY, -1, @LoadDate),
                        ETLBatchID = @ETLBatchID
@@ -328,12 +357,27 @@ BEGIN
         JOIN   #srcSensor src ON src.SerialNumber = tgt.SerialNumber
         WHERE  tgt.IsCurrent = 1 AND tgt.IsInferred = 1;
 
+        /* same-day re-version = in-place correction (see DimRoadSegment for the
+           full rationale: expiring a row created today would produce an
+           inverted, zero-length validity interval that no check can detect) */
+        UPDATE tgt
+        SET    SensorTypeName = src.SensorTypeName, Technology = src.Technology,
+               SegmentCode = src.SegmentCode, StatusClass = src.StatusClass,
+               FirmwareVersion = src.FirmwareVersion,
+               HashDiff = src.HashDiff, ETLBatchID = @ETLBatchID
+               /* InstallDate deliberately untouched — Type 0 */
+        FROM   dim.DimSensor tgt
+        JOIN   #srcSensor src ON src.SerialNumber = tgt.SerialNumber
+        WHERE  tgt.IsCurrent = 1
+          AND  tgt.EffectiveDate >= @LoadDate
+          AND  tgt.HashDiff <> src.HashDiff;
+
         DECLARE @actions TABLE (MergeAction NVARCHAR(10), SerialNumber VARCHAR(30), OldVersion INT);
 
         MERGE dim.DimSensor AS tgt
         USING #srcSensor AS src
            ON tgt.SerialNumber = src.SerialNumber AND tgt.IsCurrent = 1
-        WHEN MATCHED AND tgt.HashDiff <> src.HashDiff THEN
+        WHEN MATCHED AND tgt.HashDiff <> src.HashDiff AND tgt.EffectiveDate < @LoadDate THEN
             UPDATE SET IsCurrent = 0,
                        ExpirationDate = DATEADD(DAY, -1, @LoadDate),
                        ETLBatchID = @ETLBatchID

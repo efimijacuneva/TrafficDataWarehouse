@@ -15,6 +15,7 @@ Requires the MS SQL JDBC driver, e.g.:
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -48,7 +49,9 @@ def main(load_date: str) -> None:
         .select(
             F.col("event_id").alias("EventID"),
             F.col("event_ts").alias("EventTimestamp"),
+            F.col("detector_type").alias("DetectorType"),
             F.col("sensor_serial").alias("SensorSerial"),
+            F.col("camera_code").alias("CameraCode"),
             F.col("segment_code").alias("SegmentCode"),
             F.col("vehicle_type_code").alias("VehicleTypeCode"),
             F.col("speed_kmh").alias("SpeedKmh"),

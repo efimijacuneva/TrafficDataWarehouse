@@ -19,7 +19,7 @@ new procedure — one definition of "valid", the same philosophy as
 ```
  etl.QualityCheckCatalog          etl.usp_RunQualityChecks           etl.QualityCheckLog
  (rules as data:                  (executes, times, logs;    ──►    (one row per check per run:
-  34 checks, 6 categories)  ──►    never mutates data)               Pass/Fail, rows, ms)
+  40 checks, 6 categories)  ──►    never mutates data)               Pass/Fail, rows, ms)
                                                                           │
                           etl.usp_GetQualityReport  ◄── report ──────────┤
                           etl.usp_AssertQuality     ◄── gate (THROW) ────┘
@@ -73,7 +73,7 @@ checks clears the gate without deleting history. The full history stays in
 The rationale also lives *in the catalog itself* (`Rationale` column), so
 `SELECT * FROM etl.QualityCheckCatalog` is always current documentation.
 
-### Integrity (12 checks) — every fact row must resolve
+### Integrity (14 checks) — every fact row must resolve
 
 | Check | Target | Sev. | Why it exists |
 |---|---|---|---|
@@ -81,21 +81,25 @@ The rationale also lives *in the catalog itself* (`Rationale` column), so
 | `ORPHAN_FHT_DATE / _SEGMENT / _WEATHER` | FactHourlyTraffic | Error | The snapshot is replaced per load date; a bad key written for another date sits outside every reload window and would persist silently. |
 | `ORPHAN_FIL_DIMS`, `ORPHAN_FIL_MILESTONE_DATES` | FactIncidentLifecycle | Error | The accumulating fact is UPDATEd in place — one bad milestone update corrupts the whole incident row. All five role-playing date keys must be real days or the reserved −1 ("not yet"). |
 | `FK_CONSTRAINTS_TRUSTED` | sys.foreign_keys | Error | Re-enabling constraints `WITH NOCHECK` leaves them **untrusted**: the optimizer ignores them and violations can hide inside. Referential integrity must be provably intact, not just declared. |
+| `ORPHAN_FTE_CAMERA` | FactTrafficEvent | Error | Camera detections resolve against `DimTrafficCamera` while sensor detections take the unknown member. An unresolvable `CameraKey` means the detector routing regressed. |
+| `DETECTOR_ROUTING_FTE` | FactTrafficEvent | Error | Exactly one asset dimension may resolve per detection: a `SENSOR` row needs a real `SensorKey` and `CameraKey = -1`, a `CAMERA` row the reverse. Both resolving means a detection was counted against the wrong asset. |
 
-### Uniqueness (2 checks) — no double counting
+### Uniqueness (3 checks) — no double counting
 
 | Check | Target | Sev. | Why it exists |
 |---|---|---|---|
 | `DUP_BK_TYPE1_DIMS` | 5 Type-1 dims | Error | A duplicated business key doubles every fact joined through it. Unique indexes enforce; the check proves they weren't dropped in a tuning experiment. |
+| `DUP_INTERSECTION_DIMTRAFFICLIGHT` | DimTrafficLight | Error | `mart.vTrafficLightPerformance` joins the controller to the hourly fact through the denormalized intersection NAME (no `TrafficLightKey` exists). Safe only while one controller exists per intersection name — a second would silently double `ApproachVolume`. This turns a hidden assumption into an enforced invariant. |
 | `DUP_FACT_TRAFFICEVENT` | FactTrafficEvent | Error | **The most important check in the catalog:** the clustered-columnstore fact has *no unique constraint by design* (doc 09), so this is the only duplicate guard. A duplicate EventID means batch idempotency (delete-then-insert) regressed. |
 
-### SCD (6 checks) — history must be unambiguous
+### SCD (7 checks) — history must be unambiguous
 
 | Check | Target | Sev. | Why it exists |
 |---|---|---|---|
 | `DUP_CURRENT_DIMROADSEGMENT / _DIMSENSOR` | SCD2 dims | Error | SCD2 invariant: exactly one `IsCurrent = 1` per BK — two current rows double-count all "as-is" reporting. The filtered unique index enforces it; the check proves it. |
 | `SCD2_OVERLAP_DIMROADSEGMENT / _DIMSENSOR` | SCD2 dims | Error | Overlapping validity intervals make point-in-time fact lookups ambiguous: one event date matches two versions → the fact load joins twice → duplicated facts. |
 | `SCD2_NOCURRENT_DIMROADSEGMENT / _DIMSENSOR` | SCD2 dims | Error | A BK with only expired versions fell out of as-is reporting — the classic "MERGE expired the old row, then failed before inserting the new one" partial failure. |
+| `SCD2_INVERTED_INTERVAL` | SCD2 dims | Error | `EffectiveDate > ExpirationDate` is invisible to the overlap check (inverted ranges overlap nothing) yet point-in-time lookups silently skip the version. Produced by expiring a row that became effective on the same load date — which the loaders now prevent by correcting same-day versions in place. |
 
 ### Validity (7 checks) — measures must be physically possible
 
@@ -106,17 +110,19 @@ The rationale also lives *in the catalog itself* (`Rationale` column), so
 | `SPEED_VS_LIMIT_FHT` | FactHourlyTraffic | **Warning** | Hourly avg > 1.5× the limit is implausible but not impossible (sensor calibration, unit error). Investigate, don't block — the doc 10 invariant with production-grade severity. |
 | `CONGESTION_RANGE_FHT` | FactHourlyTraffic | Error | CongestionIndex is defined on [0,1]; out-of-range values poison every averaged KPI downstream. |
 | `FUTURE_DATE_FTE` | FactTrafficEvent | Error | Future-dated facts inflate "today" dashboards with data that hasn't happened; catches rows that escaped both timestamp rules upstream. |
-| `MILESTONE_ORDER_FIL` | FactIncidentLifecycle | Error | Accumulating-snapshot invariant: Detected ≤ Dispatched ≤ Arrived ≤ Cleared ≤ Closed wherever populated; violations produce nonsense SLA percentiles. |
+| `MILESTONE_ORDER_FIL` | FactIncidentLifecycle | Error | Accumulating-snapshot invariant: Detected ≤ Dispatched ≤ Arrived ≤ Cleared ≤ Closed wherever populated; violations produce nonsense SLA percentiles. Gating at `Error` is only possible because `sql/oltp/03_sample_data.sql` now DERIVES each milestone from its predecessor — previously they used independent offsets and 60 of 180 incidents closed before the road was cleared. |
 | `NEGATIVE_LAGS_FIL` | FactIncidentLifecycle | Error | Stored lag measures must agree with the milestone keys they were derived from. |
 
-### Completeness (4 checks) — presence, not just correctness
+### Completeness (6 checks) — presence, not just correctness
 
 | Check | Target | Sev. | Why it exists |
 |---|---|---|---|
 | `UNKNOWN_MEMBER_MISSING` | all 10 dims | Error | The −1 member is load-bearing: fact loads fall back to it via `ISNULL(key, −1)`. If it's missing, the *next* batch dies mid-load with FK errors — this check fails first, with a better message. |
 | `MANDATORY_DIMS_POPULATED` | 6 core dims | Error | Against an empty dimension every fact row maps to Unknown and the warehouse "works" while being analytically useless — the silent worst case. |
 | `SNAPSHOT_DENSITY_FHT` | FactHourlyTraffic | **Warning** | Periodic-snapshot contract: current segments × 24 rows per loaded day, zero-traffic hours included. Warning (not Error) because it presumes the pipeline ran for `@LoadDate` and because later changes to the segment set (new/retired business keys) legitimately shift the current-segment count. |
-| `UNKNOWN_RATE_FTE` | FactTrafficEvent | **Warning** | Unknown-keyed rows are legal by design but analytically blind; a spike signals upstream master-data gaps. Monitoring signal, not a gate. |
+| `UNKNOWN_RATE_FTE` | FactTrafficEvent | **Warning** | Unknown-keyed rows are legal by design but analytically blind; a spike signals upstream master-data gaps. Monitoring signal, not a gate. `SensorKey`/`CameraKey` are excluded: −1 there means "other detector technology", the normal case for half the rows. |
+| `MISSING_LOAD_DATE` | FactHourlyTraffic | **Warning** | Every other rule is scoped to the date it ran for, so a skipped night is never examined by anything. Counts calendar days between the first and last succeeded batch with no snapshot rows. |
+| `INFERRED_NEVER_COMPLETED` | SCD2 dims | **Warning** | An inferred member is a promise that master data will arrive. One still flagged after 7 days means the fact feed is inventing business keys the master data will never recognise — the exact symptom that exposed camera codes being loaded as sensors. |
 
 ### Reconciliation (3 checks) — no row unaccounted for
 

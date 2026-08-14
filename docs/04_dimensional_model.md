@@ -54,9 +54,9 @@ erDiagram
 |---|---|---|---|---|
 | `DimDate` | 0 | 3,660 (10 yrs) | FullDate | Year, Quarter, Month, WeekOfYear, DayOfWeek, IsWeekend, IsHoliday, Season |
 | `DimTime` | 0 | 1,440 (minute grain) | TimeBK (hhmm) | Hour, Minute, HourBand, DayPart, IsRushHour |
-| `DimRoadSegment` | **2** | ~2,500 (+history) | RoadSegmentID (OLTP) | RoadName, RoadCategory, City, District, Direction, LaneCount, SpeedLimitKmh, LengthM, Start/EndIntersection |
-| `DimWeatherCondition` | 0/1 | ~200 | ConditionCode+bands | Condition, TempBand, PrecipBand, VisibilityBand, IsSevere |
-| `DimVehicleType` | 1 | ~10 | TypeCode | Name, Category, WeightClass, IsHeavy |
+| `DimRoadSegment` | **2** | ~2,500 (+history) | SegmentCode | RoadName, RoadCategory, City, District, Direction, LaneCount, SpeedLimitKmh, LengthM, Start/EndIntersection |
+| `DimWeatherCondition` | 0/1 | 366 (6 conditions x 5 temp x 4 precip x 3 visibility + 6 generic) | ConditionCode+bands | Condition, TempBand, PrecipBand, VisibilityBand, IsSevere |
+| `DimVehicleType` | 1 | ~10 | TypeCode | Name, Category, IsHeavy |
 | `DimSensor` | **2** | ~2,000 (+history) | SerialNumber | SensorType, Technology, Status, RoadSegment ref, InstallDate (Type 0 attribute) |
 | `DimTrafficCamera` | **1** | ~500 | CameraCode | Model, Resolution, FirmwareVersion, Status |
 | `DimTrafficLight` | **3** | ~800 | ControllerCode | CurrentTimingPlan, **PreviousTimingPlan**, TimingPlanChangeDate, CycleSeconds |
@@ -70,7 +70,10 @@ members are possible (Sensor, RoadSegment), an *inferred member* mechanism (doc 
 
 ### `fact.FactTrafficEvent` — transaction
 - Grain: one vehicle detection. Partitioned by `DateKey` (monthly), clustered columnstore.
-- FKs: DateKey, TimeKey, RoadSegmentKey, SensorKey, VehicleTypeKey, WeatherKey.
+- FKs: DateKey, TimeKey, RoadSegmentKey, **SensorKey, CameraKey**, VehicleTypeKey, WeatherKey.
+  A detection comes from *either* a loop/radar sensor *or* an ANPR camera, so exactly one of
+  the two asset keys resolves and the other holds the unknown member (−1); `DetectorType`
+  records which. Both are NOT NULL so every asset join stays an inner join.
 - Measures: SpeedKmh, HeadwaySeconds, OccupancyPct, SpeedOverLimitKmh. Degenerate: EventID.
 - Why transaction type: it *is* the atomic business event; nothing to snapshot or accumulate.
 

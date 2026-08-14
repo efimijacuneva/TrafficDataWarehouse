@@ -55,7 +55,9 @@ be wrong, just less universal.
 - Partition column: `event_date` (daily) — matches every query's dominant filter and the
   reprocessing unit. **Not** sensor_id (2,000 partitions × small files = the classic
   small-file anti-pattern).
-- Target file size 128–512MB via `repartition("event_date")` before write.
+- `repartition("event_date")` before write → one file per date partition instead of
+  hundreds of small ones. 128–512MB per file is the target *at production scale*; on the
+  shipped 7-day demo dataset a partition file is ~0.7MB.
 - snappy for silver/gold (read-heavy, CPU-cheap), zstd for bronze (write-once archive).
-- Sort within partitions by `road_segment_id, event_ts` → better RLE + tighter min/max
-  stats → sharper pushdown.
+- Sort within partitions by `segment_code, event_ts` (job 02, silver `traffic_events`) →
+  better RLE + tighter min/max stats → sharper pushdown.

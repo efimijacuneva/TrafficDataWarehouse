@@ -10,7 +10,16 @@
 USE TrafficDW;
 GO
 
+/* NOTE ON RE-RUNNING: every CREATE TABLE below is guarded so this file can be
+   deployed against an existing database without erroring on the second run -
+   the procedures already use CREATE OR ALTER. The guard has one consequence to
+   be aware of: it also means a CHANGED column definition will NOT be applied to
+   an existing table. Schema changes therefore require either an explicit ALTER
+   (see the Rationale column in 05_quality_checks.sql) or a fresh deploy, which
+   is what scripts/run_end_to_end.ps1 does by dropping both databases first. */
+
 /* ------------------------------------------------------------------ logging */
+IF OBJECT_ID('etl.BatchLog') IS NULL
 CREATE TABLE etl.BatchLog (
     ETLBatchID   INT IDENTITY(1,1) CONSTRAINT PK_BatchLog PRIMARY KEY,
     PipelineName VARCHAR(100) NOT NULL,
@@ -21,6 +30,7 @@ CREATE TABLE etl.BatchLog (
     FinishedAt   DATETIME2(3) NULL
 );
 
+IF OBJECT_ID('etl.RowLog') IS NULL
 CREATE TABLE etl.RowLog (
     RowLogID     INT IDENTITY(1,1) CONSTRAINT PK_RowLog PRIMARY KEY,
     ETLBatchID   INT          NOT NULL CONSTRAINT FK_RowLog_Batch REFERENCES etl.BatchLog(ETLBatchID),
@@ -32,6 +42,7 @@ CREATE TABLE etl.RowLog (
     LoggedAt     DATETIME2(3) NOT NULL CONSTRAINT DF_RowLog_At DEFAULT SYSUTCDATETIME()
 );
 
+IF OBJECT_ID('etl.ErrorLog') IS NULL
 CREATE TABLE etl.ErrorLog (
     ErrorLogID   INT IDENTITY(1,1) CONSTRAINT PK_ErrorLog PRIMARY KEY,
     ETLBatchID   INT           NULL,
@@ -79,7 +90,23 @@ BEGIN
 END
 GO
 
-/* Reconciliation: extracted must equal inserted + updated + rejected per step */
+/* ============================================================================
+   RECONCILIATION REPORT — extracted must equal inserted + updated + rejected.
+
+   ONE STEP IS LEGITIMATELY EXEMPT, and it is important to say so rather than
+   let the report cry wolf. fact.FactHourlyTraffic is a DENSE periodic snapshot:
+   it cross-joins the current segments with a 24-hour spine so a row exists even
+   for hours in which nothing happened. It therefore INSERTS MORE ROWS THAN IT
+   EXTRACTS by design — on a 120-segment day, ~2,582 staged segment-hours become
+   2,880 fact rows, and the extra 298 are the zero-traffic hours that make
+   "which segments were empty at 03:00" answerable at all.
+
+   Reporting that as MISMATCH made a healthy run look broken and undermined the
+   one number the framework exists to prove. The step is now labelled
+   'OK (dense)' with the added rows shown, and the invariant that genuinely must
+   hold — extracted = loaded + rejected on the transaction fact — is unchanged
+   and still gated by the RECON_ROWLOG_BATCH quality check.
+   ========================================================================== */
 CREATE OR ALTER PROCEDURE etl.usp_ValidateBatch
     @ETLBatchID INT
 AS
@@ -88,9 +115,42 @@ BEGIN
     SELECT StepName,
            RowsExtracted,
            ISNULL(RowsInserted,0) + ISNULL(RowsUpdated,0) + ISNULL(RowsRejected,0) AS RowsAccounted,
-           CASE WHEN RowsExtracted IS NULL
+           CASE
+                /* THE contract: every staged event is loaded or rejected */
+                WHEN StepName = 'Fact.TrafficEvent' THEN
+                     CASE WHEN RowsExtracted = ISNULL(RowsInserted,0) + ISNULL(RowsUpdated,0) + ISNULL(RowsRejected,0)
+                          THEN 'OK' ELSE 'MISMATCH' END
+                /* dense snapshot: the spine may only ADD zero-traffic rows */
+                WHEN StepName = 'Fact.HourlyTraffic' THEN
+                     CASE WHEN ISNULL(RowsInserted,0) >= ISNULL(RowsExtracted,0)
+                          THEN 'OK (dense)' ELSE 'MISMATCH' END
+                /* SCD2: a version is created only when the hash actually changed,
+                   so inserted + updated is a SUBSET of the rows examined */
+                WHEN StepName LIKE 'Dim.%(SCD2)' THEN
+                     CASE WHEN ISNULL(RowsInserted,0) + ISNULL(RowsUpdated,0) <= ISNULL(RowsExtracted,0)
+                          THEN 'OK (subset)' ELSE 'MISMATCH' END
+                /* staging loads and keyed MERGEs record only what they READ:
+                   there is no per-row insert/update/reject split to reconcile */
+                WHEN StepName LIKE 'Extract.%' OR StepName LIKE 'Dim.%'
+                  OR StepName = 'Fact.IncidentLifecycle' THEN 'OK (staged)'
+                WHEN StepName LIKE 'InferredMembers%' OR StepName = 'AdvanceWatermarks'
+                     THEN 'OK (n/a)'
+                WHEN RowsExtracted IS NULL
                   OR RowsExtracted = ISNULL(RowsInserted,0) + ISNULL(RowsUpdated,0) + ISNULL(RowsRejected,0)
-                THEN 'OK' ELSE 'MISMATCH' END AS Reconciliation
+                THEN 'OK' ELSE 'MISMATCH' END AS Reconciliation,
+           CASE
+                WHEN StepName = 'Fact.HourlyTraffic'
+                     THEN CONCAT('+', ISNULL(RowsInserted,0) - ISNULL(RowsExtracted,0),
+                                 ' zero-traffic spine rows (density by design)')
+                WHEN StepName = 'Fact.TrafficEvent'
+                     THEN CONCAT(ISNULL(RowsInserted,0), ' loaded + ',
+                                 ISNULL(RowsRejected,0), ' quarantined')
+                WHEN StepName LIKE 'Dim.%(SCD2)' AND ISNULL(RowsInserted,0) + ISNULL(RowsUpdated,0) > 0
+                     THEN CONCAT(ISNULL(RowsInserted,0), ' new, ',
+                                 ISNULL(RowsUpdated,0), ' versioned')
+                WHEN StepName LIKE 'Extract.%'
+                     THEN 'staged for the dimension loads'
+           END AS Note
     FROM etl.RowLog
     WHERE ETLBatchID = @ETLBatchID
     ORDER BY RowLogID;
@@ -230,10 +290,16 @@ BEGIN
                      WHERE p.IncidentID = inc.IncidentID
                      ORDER BY p.DispatchedAt) pr
         LEFT JOIN TrafficOLTP.oltp.EmergencyVehicle ev ON ev.EmergencyVehicleID = pr.EmergencyVehicleID
+        /* Weather at the moment of detection: the most recent observation at or
+           before DetectedAt. WeatherStationID is part of the ORDER BY as a
+           DETERMINISTIC TIEBREAK — three stations report the same timestamp, so
+           without it TOP (1) picked arbitrarily and two runs of the same extract
+           could assign different WeatherKeys to the same incident, breaking the
+           idempotency the accumulating-snapshot MERGE otherwise guarantees. */
         OUTER APPLY (SELECT TOP (1) o.ConditionCode
                      FROM TrafficOLTP.oltp.WeatherObservation o
                      WHERE o.ObservedAt <= inc.DetectedAt
-                     ORDER BY o.ObservedAt DESC) w
+                     ORDER BY o.ObservedAt DESC, o.WeatherStationID) w
         WHERE inc.ModifiedAt > @wmInc AND inc.ModifiedAt <= @WatermarkUpper;
         SET @rows = @@ROWCOUNT;
         INSERT INTO etl.RowLog (ETLBatchID, StepName, RowsExtracted) VALUES (@ETLBatchID, 'Extract.IncidentLifecycle', @rows);

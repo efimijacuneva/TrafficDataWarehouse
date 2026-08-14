@@ -58,7 +58,8 @@ SmartTrafficDataWarehouse/
 │   ├── 11_future_improvements.md  # Roadmap (Airflow, Kafka, Delta Lake…)
 │   ├── 12_powerbi_dashboards.md   # Power BI semantic model + 5 dashboards
 │   ├── 13_execution_runbook.md    # End-to-end execution guide + run report
-│   └── 14_quality_framework.md    # Post-load data-quality framework (34 checks)
+│   ├── 14_quality_framework.md    # Post-load data-quality framework (40 checks)
+│   └── 15_defense_guide.md        # Likely exam questions with concise answers
 ├── sql/
 │   ├── oltp/                      # Source system: DDL + sample data
 │   ├── warehouse/                 # DW: schemas, dims, facts, indexes, mart + Power BI views
@@ -72,6 +73,8 @@ SmartTrafficDataWarehouse/
 ├── data_generator/                # Realistic synthetic source data (CSV/JSON)
 ├── data/                          # Lake zones: raw / bronze / silver / gold
 ├── orchestration/                 # Airflow DAG + docker-compose (bonus)
+├── tests/                         # pytest (Spark + source data) + T-SQL warehouse tests
+├── dashboard/                     # Streamlit pipeline / analytics / quality / SCD demo
 ├── reports/                       # Business report catalogue + views
 └── presentation/                  # Slide deck (Markdown + Mermaid diagrams)
 ```
@@ -85,55 +88,45 @@ SmartTrafficDataWarehouse/
 - **Parquet** — columnar lake storage with snappy compression, partitioned by event date
 - **Python 3.10+** — data generator and Spark jobs
 - **Power BI** — reporting layer over dedicated semantic views (`mart.vPbi*`, docs 12)
-- **Docker / Airflow** — optional orchestration layer (see `orchestration/`, docs 11)
+- **Docker** — the primary runtime: SQL Server 2022 + Spark 3.5.1 (`orchestration/docker-compose.yml`)
+- **Airflow** — optional orchestration demo reusing the same containers (docs 11)
+- **Streamlit + Plotly** — the local visual dashboard (`dashboard/`)
+- **pytest** — Spark rule tests and lake reconciliation (`tests/`)
 
 ## Quick Start
 
-**One command (Windows):** `.\scripts\run_end_to_end.ps1` — generates data, deploys
-both databases, runs Spark bronze→silver→gold, loads the warehouse per date,
-asserts the data-quality gate and prints a production-style execution summary.
-Manual/Linux steps and troubleshooting: [docs/13_execution_runbook.md](docs/13_execution_runbook.md).
+**Prerequisites: Docker Desktop (running) and Python 3.10+.** Nothing else —
+Spark, Java and SQL Server all run in containers, and the MS SQL JDBC driver is
+downloaded automatically on the first run.
 
-```bash
-# 1. Generate synthetic source data (CSV sensor feeds, JSON camera/incident events)
-python data_generator/generate_data.py --days 7 --sensors 200 --seed 42
-
-# 2. Create source + warehouse databases (run in order, sqlcmd or SSMS)
-sqlcmd -S localhost -b -I -i sql/oltp/01_create_database.sql
-sqlcmd -S localhost -b -I -i sql/oltp/02_tables.sql
-sqlcmd -S localhost -b -I -i sql/oltp/03_sample_data.sql
-sqlcmd -S localhost -b -I -i sql/warehouse/01_create_warehouse.sql
-sqlcmd -S localhost -b -I -i sql/warehouse/02_dimensions.sql
-sqlcmd -S localhost -b -I -i sql/warehouse/03_facts.sql
-sqlcmd -S localhost -b -I -i sql/warehouse/04_seed_date_time.sql
-sqlcmd -S localhost -b -I -i sql/warehouse/05_indexes_partitioning.sql
-sqlcmd -S localhost -b -I -i sql/etl/00_security.sql              # etl_spark login for Spark JDBC (job 05)
-sqlcmd -S localhost -b -I -i sql/etl/01_staging.sql
-sqlcmd -S localhost -b -I -i sql/etl/02_etl_framework.sql
-sqlcmd -S localhost -b -I -i sql/etl/03_load_dimensions.sql
-sqlcmd -S localhost -b -I -i sql/etl/04_load_facts.sql
-sqlcmd -S localhost -b -I -i sql/etl/05_quality_checks.sql       # data-quality framework (docs 14)
-sqlcmd -S localhost -b -I -i sql/etl/06_execution_summary.sql    # run-report procedure (docs 13)
-sqlcmd -S localhost -b -I -i sql/warehouse/06_mart_views.sql
-sqlcmd -S localhost -b -I -i sql/warehouse/07_powerbi_views.sql  # Power BI semantic layer (docs 12)
-
-# 3. Run the Spark medallion pipeline (per load date)
-spark-submit spark/jobs/01_ingest_raw.py          --date 2026-06-01
-spark-submit spark/jobs/02_clean_validate.py      --date 2026-06-01
-spark-submit spark/jobs/03_transform_aggregate.py --date 2026-06-01
-spark-submit spark/jobs/04_generate_kpis.py
-spark-submit --packages com.microsoft.sqlserver:mssql-jdbc:12.6.1.jre11 \
-             spark/jobs/05_load_warehouse.py      --date 2026-06-01
-
-# 4. Load the warehouse, assert quality, print the run report
-sqlcmd -S localhost -d TrafficDW -b -I -Q "EXEC etl.usp_RunNightlyPipeline @LoadDate = '2026-06-01';"
-sqlcmd -S localhost -d TrafficDW -b -I -Q "DECLARE @b INT=(SELECT MAX(ETLBatchID) FROM etl.BatchLog); EXEC etl.usp_AssertQuality @b;"
-sqlcmd -S localhost -d TrafficDW -b -I -Q "EXEC etl.usp_ExecutionSummary;"
-
-# 5. Explore analytics / build the dashboards
-sqlcmd -S localhost -i sql/analytics/01_window_functions.sql
-# Power BI: import mart.vPbi* views and follow docs/12_powerbi_dashboards.md
+```powershell
+# ONE command: starts Docker, deploys both databases, generates 7 seeded days,
+# runs Spark bronze->silver->gold, loads the warehouse per date, asserts the
+# data-quality gate, and prints a production-style execution summary.
+.\scripts\run_end_to_end.ps1
 ```
+
+Then verify, test and demonstrate:
+
+```powershell
+.\scripts\verify_project.ps1     # health check of every layer, PASS/FAIL per area
+pytest tests -v -rs              # Spark + source-data tests (skips state what is missing)
+.\scripts\run_sql_tests.ps1      # warehouse invariants, idempotency, SCD2 scenario
+.\scripts\run_scd2_demo.ps1      # SCD Type 2 versioning, live
+streamlit run dashboard/app.py   # the visual pipeline dashboard
+```
+
+Manual step-by-step execution (any platform), the full command list and
+troubleshooting: **[docs/13_execution_runbook.md](docs/13_execution_runbook.md)**.
+
+### What a run proves
+
+| Guarantee | How it is demonstrated |
+|---|---|
+| **No row is ever silently lost** | Bronze is partitioned by `ingest_date` (the file's own date), never by a value inside the row, so a corrupt or future-dated timestamp cannot hide a row from the validation gate. Job 02 writes `silver/reconciliation` asserting `rows_in = rows_good + rows_quarantined`, and `tests/test_pipeline_reconciliation.py` checks it against the raw manifest. |
+| **Reruns are safe** | Every Spark job overwrites only its own date partition; both dated facts delete-and-reload by `DateKey`; the accumulating fact and all dimensions MERGE on a key. `tests/sql/test_idempotency.sql` asserts it. |
+| **History is preserved** | `scripts/run_scd2_demo.ps1` changes a speed limit in the source and shows the old version expiring, the new one becoming current, and *older facts still resolving to the old version*. |
+| **Bad data is caught, not deleted** | ~1.5% deliberate defects are injected; each lands in quarantine with a reason. 40 catalogued quality checks then gate the load. |
 
 ## Documentation Map
 

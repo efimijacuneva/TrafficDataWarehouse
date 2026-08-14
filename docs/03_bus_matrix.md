@@ -8,12 +8,20 @@ built *before* any table design, from the analytical requirements in doc 01.
 
 | Business Process ➜ Fact | Grain | Fact type | Date | Time | RoadSegment | Road* | Location* | Weather | VehicleType | Sensor | Camera | TrafficLight | IncidentType | EmergencyUnit |
 |---|---|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| **Vehicle detection** ➜ `FactTrafficEvent` | 1 row per vehicle detected by a sensor | Transaction | ✔ | ✔ | ✔ | (✔) | (✔) | ✔ | ✔ | ✔ | | | | |
-| **Hourly traffic monitoring** ➜ `FactHourlyTraffic` | 1 row per road segment per hour | Periodic snapshot | ✔ | hour | ✔ | (✔) | (✔) | ✔ | | | | ✔ | | |
+| **Vehicle detection** ➜ `FactTrafficEvent` | 1 row per vehicle detected by a sensor **or camera** | Transaction | ✔ | ✔ | ✔ | (✔) | (✔) | ✔ | ✔ | ✔ | ✔ | | | |
+| **Hourly traffic monitoring** ➜ `FactHourlyTraffic` | 1 row per road segment per hour | Periodic snapshot | ✔ | hour | ✔ | (✔) | (✔) | ✔ | | | | | | |
 | **Incident lifecycle** ➜ `FactIncidentLifecycle` | 1 row per incident, updated as milestones occur | Accumulating snapshot | ✔×5 | ✔×5 | ✔ | (✔) | (✔) | ✔ | | | | | ✔ | ✔ |
 
 `✔×5` — the accumulating fact carries five role-playing date/time keys (detected,
 dispatched, arrived, cleared, closed).
+**`DimTrafficLight` is deliberately NOT conformed onto any fact.** No fact carries a
+`TrafficLightKey`: signal controllers describe an *intersection*, not a segment-hour, so
+there is no grain at which the key belongs. The traffic-light report reaches the
+controller through the denormalized intersection name in the mart layer, which is a
+report-layer join rather than a conformed relationship — and the assumption it depends on
+(one controller per intersection name) is enforced by the `DUP_INTERSECTION_DIMTRAFFICLIGHT`
+quality check.
+
 `(✔)` — Road and Location attributes are reached **through** `DimRoadSegment` /
 denormalized into it; they are conformed columns, not separate joins on the fact
 (see doc 04 §"snowflake avoidance").
@@ -63,7 +71,8 @@ denormalized into it; they are conformed columns, not separate joins on the fact
 | `DimRoadSegment` | all facts | The central conformed dimension; road + location attributes flattened in |
 | `DimWeatherCondition` | all facts | Banded condition (not raw measurements) so it conforms across grains |
 | `DimVehicleType` | detection fact | Sensor-classified category; individual `DimVehicle` reserved for the emergency fleet |
-| `DimSensor`, `DimTrafficCamera`, `DimTrafficLight` | asset-specific facts | Asset dims; SCD types differ per change profile (doc 05) |
+| `DimSensor`, `DimTrafficCamera` | detection fact | Two detector technologies, both conformed onto `FactTrafficEvent` via `SensorKey` / `CameraKey`; `DetectorType` says which applies and the other takes the unknown member (−1) |
+| `DimTrafficLight` | *(not conformed — see note above)* | Reached through the mart layer only |
 | `DimIncidentType`, `DimEmergencyUnit` | incident fact | |
 
 **Measures summary**

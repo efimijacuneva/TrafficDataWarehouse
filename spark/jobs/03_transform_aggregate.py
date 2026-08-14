@@ -12,6 +12,7 @@ Run:  spark-submit spark/jobs/03_transform_aggregate.py [--date 2026-06-15]
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -23,8 +24,9 @@ from config.spark_config import GOLD_DIR, SILVER_DIR, get_spark
 HEAVY_CLASSES = ("TRK", "ART", "BUS")
 
 
-def main(load_date: str | None) -> None:
+def main(load_date: Optional[str]) -> None:
     spark = get_spark("03_transform_aggregate")
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
     events = spark.read.parquet(str(SILVER_DIR / "traffic_events"))
     weather = spark.read.parquet(str(SILVER_DIR / "weather_observations"))
@@ -41,7 +43,15 @@ def main(load_date: str | None) -> None:
         .groupBy("event_date", "obs_hour")
         .agg(
             F.avg("temperature_c").alias("avg_temp_c"),
-            F.sum("precipitation_mm").alias("precipitation_mm"),
+            # AVG, not SUM: the three stations are three MEASUREMENTS OF THE
+            # SAME HOUR of city weather, not three separate rainfalls. Summing
+            # them tripled the hourly precipitation, which then pushed the
+            # weather banding (etl.fn_WeatherBands: <2.5 Light, <7.5 Moderate,
+            # else Heavy) into the wrong band and skewed every weather KPI.
+            F.avg("precipitation_mm").alias("precipitation_mm"),
+            # MIN for visibility is deliberate and different: visibility is a
+            # hazard measure, so the worst reading in the city is the one that
+            # matters — consistent with taking the WORST condition below.
             F.min("visibility_m").alias("visibility_m"),
             # dominant condition of the hour = the worst one reported
             F.max(
@@ -101,20 +111,25 @@ def main(load_date: str | None) -> None:
     (
         hourly.repartition("event_date")
         .write.mode("overwrite")
+        .option("partitionOverwriteMode", "dynamic")
         .partitionBy("event_date")
         .parquet(str(GOLD_DIR / "hourly_traffic"))
     )
     print(f"[gold] hourly_traffic: {hourly.count():,} segment-hours")
 
-    # enriched event-grain detail also lands in gold for the DW transaction fact
+    # enriched event-grain detail also lands in gold for the DW transaction fact.
+    # detector_type / sensor_serial / camera_code are all carried through so the
+    # warehouse can resolve BOTH DimSensor and DimTrafficCamera (job 02 header).
     (
         enriched.select(
-            "event_id", "event_ts", "event_date", "sensor_serial", "segment_code",
+            "event_id", "event_ts", "event_date",
+            "detector_type", "sensor_serial", "camera_code", "segment_code",
             "vehicle_type_code", "speed_kmh", "headway_seconds", "occupancy_pct",
             "condition_code", "avg_temp_c", "precipitation_mm", "visibility_m",
         )
         .repartition("event_date")
         .write.mode("overwrite")
+        .option("partitionOverwriteMode", "dynamic")
         .partitionBy("event_date")
         .parquet(str(GOLD_DIR / "traffic_events"))
     )

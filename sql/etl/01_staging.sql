@@ -9,7 +9,16 @@
 USE TrafficDW;
 GO
 
+/* NOTE ON RE-RUNNING: every CREATE TABLE below is guarded so this file can be
+   deployed against an existing database without erroring on the second run -
+   the procedures already use CREATE OR ALTER. The guard has one consequence to
+   be aware of: it also means a CHANGED column definition will NOT be applied to
+   an existing table. Schema changes therefore require either an explicit ALTER
+   (see the Rationale column in 05_quality_checks.sql) or a fresh deploy, which
+   is what scripts/run_end_to_end.ps1 does by dropping both databases first. */
+
 /* ------------------------------------------------ reference data from OLTP */
+IF OBJECT_ID('stg.RoadSegment') IS NULL
 CREATE TABLE stg.RoadSegment (
     SegmentCode        VARCHAR(30),
     RoadCode           VARCHAR(20),
@@ -28,6 +37,7 @@ CREATE TABLE stg.RoadSegment (
     SourceModifiedAt   DATETIME2(3)
 );
 
+IF OBJECT_ID('stg.Sensor') IS NULL
 CREATE TABLE stg.Sensor (
     SerialNumber     VARCHAR(30),
     SensorTypeName   NVARCHAR(50),
@@ -39,28 +49,33 @@ CREATE TABLE stg.Sensor (
     SourceModifiedAt DATETIME2(3)
 );
 
+IF OBJECT_ID('stg.VehicleType') IS NULL
 CREATE TABLE stg.VehicleType (
     TypeCode VARCHAR(10), TypeName NVARCHAR(50), Category VARCHAR(20), IsHeavy BIT,
     SourceModifiedAt DATETIME2(3)
 );
 
+IF OBJECT_ID('stg.TrafficCamera') IS NULL
 CREATE TABLE stg.TrafficCamera (
     CameraCode VARCHAR(20), IntersectionName NVARCHAR(150), Model NVARCHAR(80),
     Resolution VARCHAR(20), FirmwareVersion VARCHAR(20), Status VARCHAR(20),
     SourceModifiedAt DATETIME2(3)
 );
 
+IF OBJECT_ID('stg.TrafficLight') IS NULL
 CREATE TABLE stg.TrafficLight (
     ControllerCode VARCHAR(20), IntersectionName NVARCHAR(150),
     TimingPlan VARCHAR(30), CycleSeconds SMALLINT, Status VARCHAR(20),
     SourceModifiedAt DATETIME2(3)
 );
 
+IF OBJECT_ID('stg.IncidentType') IS NULL
 CREATE TABLE stg.IncidentType (
     TypeCode VARCHAR(10), TypeName NVARCHAR(80), Category VARCHAR(20), DefaultSeverity TINYINT,
     SourceModifiedAt DATETIME2(3)
 );
 
+IF OBJECT_ID('stg.EmergencyUnit') IS NULL
 CREATE TABLE stg.EmergencyUnit (
     UnitCode VARCHAR(20), UnitType VARCHAR(20), HomeStation NVARCHAR(100),
     VehicleMake NVARCHAR(50), VehicleModel NVARCHAR(50),
@@ -68,6 +83,7 @@ CREATE TABLE stg.EmergencyUnit (
 );
 
 /* -------------------------------------- incident lifecycle milestones (OLTP) */
+IF OBJECT_ID('stg.IncidentLifecycle') IS NULL
 CREATE TABLE stg.IncidentLifecycle (
     IncidentNumber   VARCHAR(20),
     IncidentTypeCode VARCHAR(10),
@@ -86,10 +102,17 @@ CREATE TABLE stg.IncidentLifecycle (
 );
 
 /* ------------------------------------------------ high-volume feeds (Spark) */
+/* DetectorType tells the fact load which asset dimension to resolve:
+   'SENSOR' → SensorSerial populated, CameraCode NULL
+   'CAMERA' → CameraCode   populated, SensorSerial NULL
+   (spark/jobs/02_clean_validate.py conforms both feeds to this shape) */
+IF OBJECT_ID('stg.TrafficEvent') IS NULL
 CREATE TABLE stg.TrafficEvent (
     EventID          VARCHAR(40),
     EventTimestamp   DATETIME2(3),
+    DetectorType     VARCHAR(10),
     SensorSerial     VARCHAR(30),
+    CameraCode       VARCHAR(20),
     SegmentCode      VARCHAR(30),
     VehicleTypeCode  VARCHAR(10),
     SpeedKmh         DECIMAL(5,1),
@@ -102,6 +125,7 @@ CREATE TABLE stg.TrafficEvent (
     LoadDate         DATE
 );
 
+IF OBJECT_ID('stg.HourlyTraffic') IS NULL
 CREATE TABLE stg.HourlyTraffic (
     EventDate        DATE,
     HourOfDay        TINYINT,
@@ -118,6 +142,7 @@ CREATE TABLE stg.HourlyTraffic (
 );
 
 /* --------------------------------------------------------- reject / replay */
+IF OBJECT_ID('stg.RejectTrafficEvent') IS NULL
 CREATE TABLE stg.RejectTrafficEvent (
     RejectID      BIGINT IDENTITY(1,1) PRIMARY KEY,
     ETLBatchID    INT,
@@ -131,6 +156,7 @@ CREATE TABLE stg.RejectTrafficEvent (
 );
 
 /* --------------------------------------------- incremental-extract control */
+IF OBJECT_ID('etl.WatermarkControl') IS NULL
 CREATE TABLE etl.WatermarkControl (
     SourceTable    SYSNAME       NOT NULL PRIMARY KEY,
     LastWatermark  DATETIME2(3)  NOT NULL CONSTRAINT DF_WM_Last DEFAULT '1900-01-01',

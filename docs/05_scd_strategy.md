@@ -6,7 +6,7 @@
 
 | Concept | Definition | In this project |
 |---|---|---|
-| **Business key (BK)** | Immutable identifier from the source system | `Sensor.SerialNumber`, `RoadSegmentID`, `CameraCode` |
+| **Business key (BK)** | Immutable identifier from the source system | `Sensor.SerialNumber`, `RoadSegment.SegmentCode`, `TrafficCamera.CameraCode` |
 | **Surrogate key (SK)** | Warehouse-generated `INT IDENTITY`; what facts reference | `SensorKey`, `RoadSegmentKey`, … |
 | **Current flag** | `IsCurrent BIT` — marks the active version of a BK | filter `IsCurrent = 1` for "as-is" reporting |
 | **Effective / Expiration date** | `EffectiveDate` / `ExpirationDate` validity interval; current row expires at `9999-12-31` | enables "as-was" point-in-time joins |
@@ -81,7 +81,7 @@ historical rows whenever the limit changes, while `SpeedLimitKmh` stays frozen p
 -- after a normal SCD2 versioning of SpeedLimitKmh:
 UPDATE dim.DimRoadSegment
 SET    CurrentSpeedLimitKmh = @newLimit          -- Type 1 across all versions
-WHERE  RoadSegmentID = @bk;                       -- every version of the BK
+WHERE  SegmentCode = @bk;                        -- every version of the BK
 ```
 Lets one query compare "speed vs. the limit **at the time**" and "speed vs. **today's**
 limit" without a self-join. We include this column on DimRoadSegment as a demonstration.

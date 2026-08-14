@@ -217,7 +217,28 @@ SELECT f.DateKey,
        CAST(AVG(f.SpeedKmh) AS DECIMAL(5,1))                 AS AvgSpeedKmh,
        SUM(CASE WHEN f.SpeedOverLimitKmh > 0 THEN 1 ELSE 0 END) AS SpeedingDetections
 FROM fact.FactTrafficEvent f
+WHERE f.DetectorType = 'SENSOR'    -- camera detections carry SensorKey = -1 by design
 GROUP BY f.DateKey, f.SensorKey;
+GO
+
+/* ---- Camera performance, daily grain (the mirror of vPbiSensorDaily) ------ */
+CREATE OR ALTER VIEW mart.vPbiCameraDaily AS
+SELECT f.DateKey,
+       f.CameraKey,
+       COUNT_BIG(*)                                          AS Detections,
+       COUNT(DISTINCT CASE WHEN f.TimeKey >= 0
+                           THEN f.TimeKey / 60 END)          AS ActiveHours,
+       CAST(AVG(f.SpeedKmh) AS DECIMAL(5,1))                 AS AvgSpeedKmh,
+       SUM(CASE WHEN f.SpeedOverLimitKmh > 0 THEN 1 ELSE 0 END) AS SpeedingDetections
+FROM fact.FactTrafficEvent f
+WHERE f.DetectorType = 'CAMERA'
+GROUP BY f.DateKey, f.CameraKey;
+GO
+
+/* ---- Traffic camera dimension (now referenced by the transaction fact) ---- */
+CREATE OR ALTER VIEW mart.vPbiTrafficCamera AS
+SELECT CameraKey, CameraCode, IntersectionName, Model, Resolution, FirmwareVersion, Status
+FROM dim.DimTrafficCamera;
 GO
 
 /* ---- Executive daily KPI scorecard (Executive dashboard cards/trends) ----- */

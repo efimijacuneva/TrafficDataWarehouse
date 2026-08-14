@@ -105,15 +105,30 @@ def main() -> None:
     kpi_rush_hours.write.mode("overwrite").parquet(str(GOLD_DIR / "kpi_rush_hours"))
 
     # -------------------------------------------------- quality / health ----
-    quality = spark.read.parquet(str(SILVER_DIR / "quality_metrics"))
+    # TWO DIFFERENT DATE KEYS MEET HERE, and the distinction matters:
+    #   * silver/quality_metrics is keyed by INGEST_DATE - the date of the file a
+    #     row arrived in. Quarantined rows are exactly the ones whose own
+    #     timestamp may be wrong (FUTURE_TIMESTAMP, DATE_MISMATCH, MISSING_KEY),
+    #     so their event_date cannot organise anything.
+    #   * gold/hourly_traffic is keyed by EVENT_DATE, because by then every row
+    #     has passed validation.
+    # For rows that pass, the two are equal BY CONSTRUCTION - DATE_MISMATCH
+    # quarantines anything where they differ - so the batch date is the correct
+    # join key for a per-day "how healthy was this load" summary. Both sides are
+    # renamed to load_date so the joined output cannot be misread as either one.
+    quality = (
+        spark.read.parquet(str(SILVER_DIR / "quality_metrics"))
+        .withColumnRenamed("ingest_date", "load_date")
+    )
     good_counts = spark.sql(
-        "SELECT event_date, SUM(vehicle_count) AS valid_detections FROM hourly GROUP BY event_date"
+        "SELECT event_date AS load_date, SUM(vehicle_count) AS valid_detections "
+        "FROM hourly GROUP BY event_date"
     )
     quality_daily = (
-        quality.groupBy("event_date")
+        quality.groupBy("load_date")
         .pivot("reject_reason")
         .sum("rejected_rows")
-        .join(good_counts, "event_date", "full")
+        .join(good_counts, "load_date", "full")
         .na.fill(0)
     )
     quality_daily.write.mode("overwrite").parquet(str(GOLD_DIR / "quality_daily"))

@@ -17,6 +17,11 @@ duplicated event_ids, whitespace/sentinel strings.
 Usage:
   python data_generator/generate_data.py --days 7 --sensors 200 --start 2026-06-01 --seed 42
 """
+from __future__ import annotations  # keeps list[dict] importable on Python 3.8
+# ^ the generator itself targets 3.10+, but the Spark container ships 3.8 and the
+#   test suite imports this module there. Deferring annotation evaluation costs
+#   nothing and makes the module import-safe on both.
+
 import argparse
 import csv
 import json

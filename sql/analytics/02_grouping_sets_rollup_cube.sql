@@ -11,8 +11,15 @@ GO
         total, in one result set."  → ROLLUP (hierarchical subtotals).
        ROLLUP(A, B) produces: (A,B), (A), () — a drill-up path.
    ========================================================================== */
-SELECT ISNULL(s.RoadCategory, '== ALL CATEGORIES ==')   AS RoadCategory,
-       ISNULL(d.YearMonth,   '== ALL MONTHS ==')        AS YearMonth,
+/* GROUPING(col) - not ISNULL(col) - distinguishes "NULL because this row is a
+   SUBTOTAL" from "NULL because the underlying value is NULL". ISNULL conflates
+   them: a genuinely NULL RoadCategory would be mislabelled as the grand total.
+   Both columns are NOT NULL today, so ISNULL happened to work, but the pattern
+   is wrong and the same file demonstrates GROUPING_ID correctly in Q3. */
+SELECT CASE WHEN GROUPING(s.RoadCategory) = 1 THEN '== ALL CATEGORIES =='
+            ELSE s.RoadCategory END                     AS RoadCategory,
+       CASE WHEN GROUPING(d.YearMonth) = 1 THEN '== ALL MONTHS =='
+            ELSE d.YearMonth END                        AS YearMonth,
        SUM(f.VehicleCount)                              AS TotalVehicles,
        CAST(AVG(f.AvgSpeedKmh) AS DECIMAL(5,1))         AS AvgSpeed
 FROM fact.FactHourlyTraffic f
@@ -28,7 +35,8 @@ GO
         including ALL marginal totals."  → CUBE (every combination).
        CUBE(A, B) produces: (A,B), (A), (B), ().
    ========================================================================== */
-SELECT ISNULL(w.ConditionName, 'ALL WEATHER')                    AS Weather,
+SELECT CASE WHEN GROUPING(w.ConditionName) = 1 THEN 'ALL WEATHER'
+            ELSE w.ConditionName END                             AS Weather,
        CASE WHEN GROUPING(vt.IsHeavy) = 1 THEN 'ALL VEHICLES'
             WHEN vt.IsHeavy = 1 THEN 'Heavy' ELSE 'Light' END    AS VehicleClass,
        COUNT_BIG(*)                                              AS Detections,
@@ -71,7 +79,8 @@ GO
    Q4. "Incident severity report: counts and response SLA by incident category
         and severity with drill-up subtotals."  → ROLLUP over the accumulating fact.
    ========================================================================== */
-SELECT ISNULL(it.Category, 'ALL CATEGORIES')            AS IncidentCategory,
+SELECT CASE WHEN GROUPING(it.Category) = 1 THEN 'ALL CATEGORIES'
+            ELSE it.Category END                        AS IncidentCategory,
        CASE WHEN GROUPING(f.Severity) = 1 THEN NULL ELSE f.Severity END AS Severity,
        COUNT(*)                                         AS Incidents,
        CAST(AVG(1.0 * f.MinutesToArrive) AS DECIMAL(6,1)) AS AvgResponseMin,

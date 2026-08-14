@@ -60,7 +60,7 @@ erDiagram
 | `TrafficLight` | Signal controller | TimingPlan replaced by engineering team (SCD3 in DW) |
 | `VehicleType`, `Vehicle` | Vehicle classification + registered fleet | Individual vehicles known only for the municipal/emergency fleet; plate stored as salted hash (GDPR) |
 | `EmergencyVehicle` | Subtype of Vehicle | 1:0..1 subtype pattern |
-| `WeatherStation`, `WeatherObservation` | Weather measurement | One observation per station per 10 min |
+| `WeatherStation`, `WeatherObservation` | Weather measurement | One observation per station per hour |
 | `TrafficMeasurement` | One vehicle detection by one sensor | THE high-volume table; in production this bypasses OLTP and lands as CSV — kept here small for lineage demonstration |
 | `IncidentType`, `Incident` | Accidents, breakdowns, roadworks, hazards | Status workflow: Detected → Responded → Cleared → Closed |
 | `PoliceResponse` | Dispatch record per incident per unit | Milestone timestamps feed the accumulating snapshot fact |
@@ -74,8 +74,11 @@ erDiagram
   uses for SCD matching.
 - All FKs declared with `ON DELETE NO ACTION` — operational data is never cascade-deleted;
   assets are soft-retired via `Status`.
-- `rowversion`/`ModifiedAt` columns on mutable tables support **incremental extraction**
-  (high-watermark pattern, see doc 06).
+- `ModifiedAt DATETIME2(3)` columns on mutable tables support **incremental extraction**
+  (high-watermark pattern, see doc 06). *Known limitation:* a `DATETIME2` watermark can
+  miss rows whose transaction commits after the extract captured its upper bound.
+  `rowversion` + `MIN_ACTIVE_ROWVERSION()` is the standard hardening and is a roadmap
+  item (doc 11) — it is **not** implemented here, and the code is the source of truth.
 
 Implementation: [sql/oltp/01_create_database.sql](../sql/oltp/01_create_database.sql),
 [sql/oltp/02_tables.sql](../sql/oltp/02_tables.sql), sample data in

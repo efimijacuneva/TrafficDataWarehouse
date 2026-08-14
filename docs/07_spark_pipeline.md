@@ -46,10 +46,14 @@ slowly changing history. Each engine does only what it is best at.
    broadcast), derives congestion measures, aggregates to segment×hour grain.
    Demonstrates **both APIs deliberately**: DataFrame API for the pipeline plumbing,
    **Spark SQL** for the business aggregations (readable by analysts).
-4. **`04_generate_kpis.py`** — computes the KPI catalogue (congestion index, P85 speeds,
-   weather speed-penalty, rush-hour ranks) using window functions over gold.
+4. **`04_generate_kpis.py`** — computes the KPI datasets (daily volume/speed per segment
+   with `MAX_BY` peak hour, `RANK` city-wide and `LAG` day-over-day delta; weather speed
+   penalty vs a DRY baseline; P85 rush hours; a pivoted daily quality dataset) using window
+   functions over gold. The congestion index is **not** computed here — the speed limit is a
+   dimension attribute that never reaches gold, so it is derived in the warehouse load.
 5. **`05_load_warehouse.py`** — writes gold datasets to SQL Server staging via JDBC
-   (batched, `tablock`, idempotent per load date), where T-SQL procs take over.
+   (`truncate=true` + `batchsize=10000`, idempotent per load date), where the T-SQL procs
+   take over. Pure handover: no joins, no aggregation, no broadcast.
 
 ## Spark SQL and DataFrame API — both, on purpose
 
@@ -64,7 +68,9 @@ Both compile to the same Catalyst logical plan — the choice is about *audience
 
 - Explicit `StructType` schema for the high-volume CSV feed (no inference pass, stable
   types, `_corrupt_record` capture); the small JSON feeds are read schema-on-read.
-- `broadcast()` hints for small dimension lookups (weather stations, segments) — doc 09.
+- `broadcast()` hint for the hourly weather aggregate in job 03 — <=24 rows against
+  hundreds of thousands of detections, so the small side ships to every executor and the
+  large side is never shuffled. It is the only broadcast join in the pipeline.
 - Repartition-by-partition-column before write → one tidy file per date partition instead
   of hundreds of small files.
 - `spark.sql.shuffle.partitions` tuned per job size; AQE enabled (doc 09).
