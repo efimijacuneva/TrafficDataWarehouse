@@ -42,8 +42,18 @@ services:
   spark:
     image: apache/spark:3.5.1
     container_name: trafficdw-spark
-    # long-lived idle container; jobs are submitted with `docker exec`
-    command: ["/bin/bash", "-c", "trap : TERM INT; sleep infinity & wait"]
+    # long-lived idle container; jobs are submitted with `docker exec`.
+    #
+    # pytest is installed at START, not baked in and not left to a manual
+    # `docker exec ... pip install`: pip writes to the container's writable
+    # layer, so `docker compose down` destroys it and the next `up` gives you a
+    # container whose Spark tests cannot run. scripts/verify_project.ps1 then
+    # honestly reports SKIP (it will not claim 52 tests passed when it could not
+    # run them), which looks like a regression but is only a missing dependency.
+    # `|| true` keeps the container starting normally when offline - you lose the
+    # in-container test tier for that session, nothing else.
+    command: ["/bin/bash", "-c",
+              "pip3 install --quiet pytest 2>/dev/null || true; trap : TERM INT; sleep infinity & wait"]
     user: root                      # needs write access to the mounted data/ lake
     environment:
       # spark/config/spark_config.py reads this to build the JDBC URL; `mssql`

@@ -58,7 +58,7 @@ SmartTrafficDataWarehouse/
 │   ├── 11_future_improvements.md  # Roadmap (Airflow, Kafka, Delta Lake…)
 │   ├── 12_powerbi_dashboards.md   # Power BI semantic model + 5 dashboards
 │   ├── 13_execution_runbook.md    # End-to-end execution guide + run report
-│   ├── 14_quality_framework.md    # Post-load data-quality framework (40 checks)
+│   ├── 14_quality_framework.md    # Post-load data-quality framework (41 checks)
 │   └── 15_defense_guide.md        # Likely exam questions with concise answers
 ├── sql/
 │   ├── oltp/                      # Source system: DDL + sample data
@@ -126,7 +126,7 @@ troubleshooting: **[docs/13_execution_runbook.md](docs/13_execution_runbook.md)*
 | **No row is ever silently lost** | Bronze is partitioned by `ingest_date` (the file's own date), never by a value inside the row, so a corrupt or future-dated timestamp cannot hide a row from the validation gate. Job 02 writes `silver/reconciliation` asserting `rows_in = rows_good + rows_quarantined`, and `tests/test_pipeline_reconciliation.py` checks it against the raw manifest. |
 | **Reruns are safe** | Every Spark job overwrites only its own date partition; both dated facts delete-and-reload by `DateKey`; the accumulating fact and all dimensions MERGE on a key. `tests/sql/test_idempotency.sql` asserts it. |
 | **History is preserved** | `scripts/run_scd2_demo.ps1` changes a speed limit in the source and shows the old version expiring, the new one becoming current, and *older facts still resolving to the old version*. |
-| **Bad data is caught, not deleted** | ~1.5% deliberate defects are injected; each lands in quarantine with a reason. 40 catalogued quality checks then gate the load. |
+| **Bad data is caught, not deleted** | ~1.5% deliberate defects are injected; each lands in quarantine with a reason. 41 catalogued quality checks then gate the load. |
 
 ## Documentation Map
 

@@ -480,10 +480,42 @@ transaction fact, because no row exists. The density is guaranteed by
 cross-joining the current segments with a 24-hour spine.
 
 **Insert / update:** delete-and-reload per load date.
+
+Below: **one segment's complete day**. There are 120 rows at every single
+(date, hour) - one per segment - so a plain `TOP (20)` would show hour 0
+twenty times and demonstrate nothing. Following one segment across all 24
+hours shows the grain, the unbroken spine, and the zero-traffic hours that
+only a snapshot can record (`VehicleCount = 0`, speed `NULL` - no vehicles
+passed, so there is no speed to average, which is not the same as 0 km/h).
 """)
-        df, s = da.query("SELECT TOP (20) * FROM fact.FactHourlyTraffic ORDER BY DateKey DESC, HourOfDay")
+        df, s = da.query("""
+WITH latest AS (SELECT MAX(DateKey) AS DateKey FROM fact.FactHourlyTraffic),
+     pick AS (
+         SELECT TOP (1) f.RoadSegmentKey
+         FROM fact.FactHourlyTraffic f
+         JOIN latest l ON l.DateKey = f.DateKey
+         GROUP BY f.RoadSegmentKey
+         -- busiest segment that STILL has quiet hours, so one table shows both
+         -- a full rush-hour peak and the empty overnight rows
+         HAVING SUM(CASE WHEN f.VehicleCount = 0 THEN 1 ELSE 0 END) > 0
+         ORDER BY SUM(f.VehicleCount) DESC
+     )
+SELECT rs.SegmentCode, rs.RoadCategory, rs.SpeedLimitKmh,
+       f.DateKey, f.HourOfDay, f.VehicleCount, f.HeavyVehicleCount,
+       f.AvgSpeedKmh, f.AvgOccupancyPct, f.CongestionIndex
+FROM fact.FactHourlyTraffic f
+JOIN latest l ON l.DateKey = f.DateKey
+JOIN pick   p ON p.RoadSegmentKey = f.RoadSegmentKey
+JOIN dim.DimRoadSegment rs ON rs.RoadSegmentKey = f.RoadSegmentKey
+ORDER BY f.HourOfDay
+""")
         if show_status(s, "FactHourlyTraffic"):
             st.dataframe(df, use_container_width=True, hide_index=True)
+            st.caption(
+                f"{len(df)} rows = 24 hours, no gaps. "
+                f"{int((df['VehicleCount'] == 0).sum())} hour(s) carried zero traffic "
+                "and are still present as rows - that is the point of a periodic snapshot."
+            )
 
     with tabs[2]:
         st.subheader("fact.FactIncidentLifecycle")

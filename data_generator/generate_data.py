@@ -10,6 +10,8 @@ behaviour AND deliberate data-quality problems (to exercise the silver gate):
 Realism:
   * diurnal volume curve with AM/PM rush peaks, weekend damping
   * speed inversely correlated with volume (congestion), weather penalty
+  * speed generated RELATIVE TO EACH SEGMENT's posted limit and road category,
+    so the congestion index ranks local streets above arterials above highway
   * heavy-vehicle share higher at night
 Injected defects (~1.5% of rows): missing keys, speed=999, occupancy>100,
 duplicated event_ids, whitespace/sentinel strings.
@@ -52,6 +54,49 @@ def seg_code(i: int) -> str:
 
 def sensor_serial(i: int) -> str:
     return f"SNS-{i:04d}"
+
+
+# --------------------------------------------------------------- road model --
+# MUST mirror oltp.Road / oltp.RoadSegment in sql/oltp/03_sample_data.sql:
+# 120 segments, 12 per road, roads 3 and 10 highway, road 7 a local street.
+# Generating speed WITHOUT this mapping is what made the congestion index rank
+# road categories backwards - free flow was assigned by segment index, so the
+# 30 km/h local street was handed a 55 km/h free flow (traffic "never"
+# congested, and habitually 135% of the posted limit) while the 100 km/h
+# highway also got 55 (permanently "congested"). Speed must be generated
+# relative to the road it happens on.
+ROAD_CATEGORY = {1: "Arterial", 2: "Arterial", 3: "Highway",  4: "Arterial",
+                 5: "Collector", 6: "Arterial", 7: "Local",   8: "Collector",
+                 9: "Arterial", 10: "Highway"}
+
+# free_flow_ratio: empty-road speed as a fraction of the posted limit - drivers
+#   habitually exceed it slightly, and the margin is widest where enforcement is
+#   loosest and the road is straightest.
+# sensitivity:     how much speed is lost at peak demand. Grade-separated
+#   highway holds its speed until capacity; a local street loses most of it to
+#   signals, parked cars and pedestrians. This ordering is what makes local
+#   streets the most congested and the highway the least - as in a real city.
+ROAD_BEHAVIOUR = {
+    "Highway":   {"free_flow_ratio": 1.08, "sensitivity": 0.30},
+    "Arterial":  {"free_flow_ratio": 1.06, "sensitivity": 0.45},
+    "Collector": {"free_flow_ratio": 1.04, "sensitivity": 0.52},
+    "Local":     {"free_flow_ratio": 1.02, "sensitivity": 0.62},
+}
+
+
+def segment_profile(segment_i: int) -> tuple[str, int, float, float]:
+    """(category, posted limit, free-flow speed, congestion sensitivity)."""
+    road = 1 + (segment_i - 1) // 12                     # road 1..10
+    category = ROAD_CATEGORY[road]
+    if category == "Highway":
+        limit = 100
+    elif road == 7:
+        limit = 30
+    else:
+        limit = 50 + 10 * (segment_i % 2)
+    behaviour = ROAD_BEHAVIOUR[category]
+    return (category, limit,
+            limit * behaviour["free_flow_ratio"], behaviour["sensitivity"])
 
 
 def daily_weather(rng: random.Random, day: date) -> list[dict]:
@@ -107,10 +152,16 @@ def generate_day(rng: random.Random, day: date, n_sensors: int,
                               rng.randint(0, 999) * 1000)
                 event_id = f"EVT-{stamp}-{n_csv + 1:07d}"
                 vt = rng.choice(VEHICLE_TYPES)
-                # congestion: high intensity → low speed; weather penalty on top
-                free_flow = 90 if segment_i <= 36 else 55
+                # congestion: high intensity → low speed; weather penalty on top.
+                # Free flow and sensitivity both come from the SEGMENT's own
+                # road, so speed is always meaningful against its posted limit.
+                _, _, free_flow, sensitivity = segment_profile(segment_i)
+                # spread scales with speed: a 100 km/h road varies far more in
+                # absolute terms than a 30 km/h street, and a fixed sigma would
+                # push a congested local street into the 5 km/h floor.
                 speed = max(5.0, rng.gauss(
-                    free_flow * (1 - 0.55 * intensity) * (1 - speed_penalty), 8))
+                    free_flow * (1 - sensitivity * intensity) * (1 - speed_penalty),
+                    0.12 * free_flow))
                 occupancy = min(98.0, max(1.0, 90 * intensity + rng.uniform(-10, 10)))
                 headway = max(0.4, rng.expovariate(intensity * 0.9 + 0.1))
 
@@ -146,6 +197,14 @@ def generate_day(rng: random.Random, day: date, n_sensors: int,
         hour = rng.choices(range(24), weights=WEEKDAY_PROFILE)[0]
         segment_i = rng.randint(1, 120)
         ts = datetime(day.year, day.month, day.day, hour, rng.randint(0, 59), rng.randint(0, 59))
+        # ANPR speed follows the same road model as the sensors - a camera on
+        # the airport corridor must not report the same 48 km/h as one on a
+        # 30 km/h side street, or SpeedOverLimitKmh is meaningless for cameras.
+        cam_intensity = WEEKDAY_PROFILE[hour] * (WEEKEND_DAMPING if is_weekend else 1.0)
+        _, _, cam_free_flow, cam_sensitivity = segment_profile(segment_i)
+        cam_speed = max(5.0, rng.gauss(
+            cam_free_flow * (1 - cam_sensitivity * cam_intensity) * (1 - speed_penalty),
+            0.12 * cam_free_flow))
         camera_events.append({
             "event_id": f"CAM-{stamp}-{i + 1:06d}",
             "camera_code": f"CAM-{rng.randint(1, 50):03d}",
@@ -154,7 +213,7 @@ def generate_day(rng: random.Random, day: date, n_sensors: int,
                 "segment_code": seg_code(segment_i),
                 "direction": rng.choice(DIRECTIONS),
                 "vehicle_class": rng.choice(VEHICLE_TYPES),
-                "speed_kmh": round(max(5.0, rng.gauss(48, 12)), 1),
+                "speed_kmh": round(cam_speed, 1),
                 "plate_hash": f"{rng.getrandbits(128):032x}",
             },
         })

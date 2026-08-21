@@ -19,7 +19,7 @@ new procedure — one definition of "valid", the same philosophy as
 ```
  etl.QualityCheckCatalog          etl.usp_RunQualityChecks           etl.QualityCheckLog
  (rules as data:                  (executes, times, logs;    ──►    (one row per check per run:
-  40 checks, 6 categories)  ──►    never mutates data)               Pass/Fail, rows, ms)
+  41 checks, 6 categories)  ──►    never mutates data)               Pass/Fail, rows, ms)
                                                                           │
                           etl.usp_GetQualityReport  ◄── report ──────────┤
                           etl.usp_AssertQuality     ◄── gate (THROW) ────┘

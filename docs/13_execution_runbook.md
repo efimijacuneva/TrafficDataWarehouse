@@ -95,7 +95,7 @@ SQLC /opt/sql/etl/01_staging.sql
 SQLC /opt/sql/etl/02_etl_framework.sql
 SQLC /opt/sql/etl/03_load_dimensions.sql
 SQLC /opt/sql/etl/04_load_facts.sql
-SQLC /opt/sql/etl/05_quality_checks.sql             # <- quality framework (40 checks)
+SQLC /opt/sql/etl/05_quality_checks.sql             # <- quality framework (41 checks)
 SQLC /opt/sql/etl/06_execution_summary.sql          # <- run report
 # presentation layer
 SQLC /opt/sql/warehouse/06_mart_views.sql

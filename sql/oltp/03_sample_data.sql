@@ -97,7 +97,9 @@ SELECT CONCAT('CAM-', RIGHT('000' + CAST(n.i AS VARCHAR(3)), 3)),
        DATEADD(DAY, -(n.i * 11 % 1100), '2026-01-01')
 FROM n;
 
-/* 45 traffic lights at the signalized intersections */
+/* one traffic light per signalized intersection = 30 lights.
+   (Of the 60 intersections above, i % 4 IN (1,2) makes exactly 30 'Signalized';
+   roundabouts and priority junctions have no controller.) */
 ;WITH sig AS (SELECT IntersectionID, ROW_NUMBER() OVER (ORDER BY IntersectionID) AS rn
               FROM oltp.Intersection WHERE IntersectionType = 'Signalized')
 INSERT INTO oltp.TrafficLight (ControllerCode, IntersectionID, TimingPlan, CycleSeconds, InstallDate)
@@ -197,25 +199,73 @@ INSERT INTO oltp.IncidentType (TypeCode, TypeName, Category, DefaultSeverity) VA
    was cleared. That produced permanent failures of the MILESTONE_ORDER_FIL
    quality check (sql/etl/05_quality_checks.sql).
    Deliberate DATA-QUALITY defects belong in the file feeds, not in the OLTP
-   system of record — see data_generator/generate_data.py.                     */
+   system of record — see data_generator/generate_data.py.
+
+   SEVERITY AND DURATIONS ARE MODELLED, NOT COUNTED OFF. The earlier version
+   used plain arithmetic on the row number: Severity = 1 + (i*3 % 5) cycled
+   4,2,5,3,1 independently of the incident TYPE, so every category averaged
+   severity 3.000000 and oltp.IncidentType.DefaultSeverity — which exists
+   precisely to say a pedestrian accident is worse than road works — was never
+   reflected anywhere. The response lags marched 5,6,7,8,9,... in IncidentID
+   order, which is plainly visible in the first screen of the incident tab.
+
+   Instead each incident draws from SHA2_256(i || purpose), which is
+   deterministic (same database on every rebuild, so tests stay reproducible)
+   but carries no ordering: consecutive incidents get unrelated values. The
+   draws then feed a small behavioural model —
+       severity   = the TYPE's default, jittered +/-1, clamped to 1..5
+       lanes      = more lanes blocked the more severe the incident
+       clearance  = longer for severe incidents
+   — so the numbers answer "why" and not merely "what".
+
+   CHECKSUM(...) % 100000 is taken BEFORE ABS: ABS(CHECKSUM(...)) alone can
+   overflow on the single value -2147483648, which has no positive counterpart
+   in INT.                                                                    */
 ;WITH n AS (SELECT TOP (180) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects),
- m AS (
+ h AS (   /* deterministic, order-free pseudo-random draws, one per purpose */
     SELECT n.i,
-           DATEADD(MINUTE, (n.i * 227) % 43200, '2026-06-01')       AS DetectedAt,
-           /* clearance happens 25..114 min AFTER detection                */
-           25 + n.i % 90                                            AS ClearOffsetMin,
-           /* closure happens a further 20..79 min AFTER clearance        */
-           20 + n.i % 60                                            AS CloseOffsetMin
+           1 + (n.i % 9) AS IncidentTypeID,
+           ABS(CHECKSUM(HASHBYTES('SHA2_256', CONCAT(CAST(n.i AS VARCHAR(10)), '|sev'  ))) % 100000) AS hSev,
+           ABS(CHECKSUM(HASHBYTES('SHA2_256', CONCAT(CAST(n.i AS VARCHAR(10)), '|lanes'))) % 100000) AS hLanes,
+           ABS(CHECKSUM(HASHBYTES('SHA2_256', CONCAT(CAST(n.i AS VARCHAR(10)), '|clear'))) % 100000) AS hClear,
+           ABS(CHECKSUM(HASHBYTES('SHA2_256', CONCAT(CAST(n.i AS VARCHAR(10)), '|close'))) % 100000) AS hClose
     FROM n
+ ),
+ s AS (   /* severity: the TYPE's own default, jittered, clamped to CK_Incident_Sev */
+    SELECT h.*,
+           CASE WHEN it.DefaultSeverity + j.d < 1 THEN 1
+                WHEN it.DefaultSeverity + j.d > 5 THEN 5
+                ELSE it.DefaultSeverity + j.d END AS Severity
+    FROM h
+    JOIN oltp.IncidentType it ON it.IncidentTypeID = h.IncidentTypeID
+    CROSS APPLY (SELECT CASE WHEN h.hSev % 10 < 2 THEN -1     -- 20% one milder
+                             WHEN h.hSev % 10 > 7 THEN  1     -- 20% one worse
+                             ELSE 0 END AS d) j               -- 60% at the type default
+ ),
+ m AS (
+    SELECT s.*,
+           DATEADD(MINUTE, (s.i * 227) % 43200, '2026-06-01')  AS DetectedAt,
+           /* clearance 27..90 min after detection, longer the worse it is.
+              The MINIMUM here (20 + 0 + 1*7 = 27) must stay above the MAXIMUM
+              dispatch+arrival below (6 + 15 = 21) or Arrived <= RoadCleared
+              breaks and MILESTONE_ORDER_FIL fails. */
+           20 + (s.hClear % 45) + s.Severity * 7               AS ClearOffsetMin,
+           /* administrative closure a further 19..80 min after clearance */
+           15 + (s.hClose % 50) + s.Severity * 4               AS CloseOffsetMin
+    FROM s
  )
 INSERT INTO oltp.Incident
       (IncidentNumber, IncidentTypeID, RoadSegmentID, DetectedAt, Severity, LanesBlocked, Description, Status, RoadClearedAt, ClosedAt)
 SELECT CONCAT('INC-2026-', RIGHT('00000' + CAST(m.i AS VARCHAR(5)), 5)),
-       1 + (m.i % 9),
+       m.IncidentTypeID,
        1 + (m.i * 7 % 120),
        m.DetectedAt,                                                -- spread over 30 days
-       1 + ((m.i * 3) % 5),
-       m.i % 3,
+       m.Severity,
+       /* a severe incident closes more of the carriageway than a signal fault */
+       CASE WHEN m.Severity >= 5 THEN 2 + (m.hLanes % 2)             -- 2-3 lanes
+            WHEN m.Severity  = 4 THEN 1 + (m.hLanes % 2)             -- 1-2 lanes
+            WHEN m.Severity  = 3 THEN 1
+            ELSE m.hLanes % 2 END,                                   -- 0-1 lanes
        CONCAT(N'Auto-generated incident #', m.i),
        CASE WHEN m.i % 10 = 0 THEN 'Detected'
             WHEN m.i % 10 = 1 THEN 'Responded'
@@ -228,19 +278,33 @@ SELECT CONCAT('INC-2026-', RIGHT('00000' + CAST(m.i AS VARCHAR(5)), 5)),
 FROM m;
 
 /* Police responses for all non-'Detected' incidents.
+
    Same monotonicity rule: ArrivedAt is derived FROM DispatchedAt, so
    CK_Response_Order (ArrivedAt >= DispatchedAt) holds by construction, and the
-   maximum arrival offset (7 + 16 = 23 min) stays below the minimum clearance
-   offset (25 min) so Arrived <= RoadCleared always holds too.                */
+   maximum dispatch+arrival (6 + 15 = 21 min) stays below the minimum clearance
+   offset (27 min) so Arrived <= RoadCleared always holds too.
+
+   The lags were previously 2 + IncidentID % 6 and 4 + IncidentID % 13, which
+   made MinutesToArrive run 5,6,7,8,9,10,... straight down the incident tab.
+   They now come from the same SHA2_256 draw as the incident itself, and a
+   severe incident is prioritised: control rooms dispatch and reach a serious
+   collision faster than a signal fault, which is what makes the response-time
+   analysis in the mart worth running at all.                                 */
 INSERT INTO oltp.PoliceResponse (IncidentID, EmergencyVehicleID, DispatchedAt, ArrivedAt, ClearedAt)
 SELECT i.IncidentID,
        1 + (i.IncidentID % 40),
        d.DispatchedAt,
        CASE WHEN i.Status IN ('Responded','Cleared','Closed')
-            THEN DATEADD(MINUTE, 4 + i.IncidentID % 13, d.DispatchedAt) END,
+            THEN DATEADD(MINUTE, a.ArriveMin, d.DispatchedAt) END,
        CASE WHEN i.Status IN ('Cleared','Closed') THEN i.RoadClearedAt END
 FROM oltp.Incident i
-CROSS APPLY (SELECT DATEADD(MINUTE, 2 + i.IncidentID % 6, i.DetectedAt) AS DispatchedAt) d
+CROSS APPLY (SELECT ABS(CHECKSUM(HASHBYTES('SHA2_256', CONCAT(CAST(i.IncidentID AS VARCHAR(10)), '|disp'))) % 100000) AS hD,
+                    ABS(CHECKSUM(HASHBYTES('SHA2_256', CONCAT(CAST(i.IncidentID AS VARCHAR(10)), '|arr' ))) % 100000) AS hA) hh
+/* severity >= 4 is prioritised: dispatched in 1-4 min instead of 3-6,
+   on scene in 3-10 min instead of 8-15 */
+CROSS APPLY (SELECT 1 + (hh.hD % 4) + CASE WHEN i.Severity >= 4 THEN 0 ELSE 2 END AS DispMin) dm
+CROSS APPLY (SELECT DATEADD(MINUTE, dm.DispMin, i.DetectedAt) AS DispatchedAt) d
+CROSS APPLY (SELECT 3 + (hh.hA % 8) + CASE WHEN i.Severity >= 4 THEN 0 ELSE 5 END AS ArriveMin) a
 WHERE i.Status <> 'Detected';
 
 /* ---------------------------------------------------------------- maintenance */

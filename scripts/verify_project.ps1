@@ -145,7 +145,7 @@ Write-Host "SQL Server" -ForegroundColor White
 $version = if ($dockerOk) { Test-Sql "SET NOCOUNT ON; SELECT 1" "master" } else { $null }
 if (-not $version) {
     foreach ($a in @("Connectivity","Databases","Schemas","Dimensions","Facts","Unknown members",
-                     "SCD2 integrity","Quality checks","Quality gate")) {
+                     "SCD2 integrity","Quality checks","Quality gate","Analytics SQL")) {
         Add-Result $a "SKIP" "SQL Server unreachable"
     }
 } else {
@@ -216,6 +216,62 @@ SELECT COUNT(*) FROM latest WHERE rn=1 AND Severity='Error' AND Status='Fail'
     if ($null -eq $failed -or $failed -eq "") { Add-Result "Quality gate" "SKIP" "no checks have run yet" }
     elseif ($failed -eq "0")                  { Add-Result "Quality gate" "PASS" "no Error-severity failures" }
     else                                      { Add-Result "Quality gate" "FAIL" "$failed Error check(s) failing - EXEC etl.usp_GetQualityReport" }
+
+    # ------------------------------------------- 5b. advanced SQL deliverables --
+    # THE BLIND SPOT THIS CLOSES: nothing else in this suite ever EXECUTES
+    # sql/analytics/*.sql. The board therefore read READY while
+    # 03_recursive_cte.sql aborted on every single run - a missing semicolon
+    # before a CTE's WITH - because the failure lived in a graded deliverable
+    # that no automated step touched. A demo script that has never been run is
+    # not evidence of anything.
+    #
+    # Two ways to fail, because "it did not error" is a weak bar for a query
+    # whose whole job is to return an answer:
+    #   * non-zero exit  -> the script is broken
+    #   * zero rows      -> it runs but demonstrates nothing. That was real too:
+    #                       Q2 asked for routes to an intersection 11 hops away
+    #                       with the search capped at 5, so it could only ever
+    #                       return an empty set.
+    # Zero-row results are reported as FAIL rather than a warning: an empty
+    # showcase query in front of an examiner is a defect, not a curiosity.
+    $analyticsDir = Join-Path $RepoRoot "sql\analytics"
+    if (-not (Test-Path $analyticsDir)) {
+        Add-Result "Analytics SQL" "SKIP" "sql/analytics not present"
+    } else {
+        $scripts = Get-ChildItem $analyticsDir -Filter "*.sql" | Sort-Object Name
+        if (-not $scripts) {
+            Add-Result "Analytics SQL" "SKIP" "no .sql files in sql/analytics"
+        } else {
+            $broken = @(); $barren = @()
+            foreach ($sc in $scripts) {
+                # docker cp, never `-i` with piped stdin: PowerShell encodes the
+                # stream with $OutputEncoding, which varies by session and can
+                # prepend a BOM that sqlcmd reports as "Incorrect syntax near '?'".
+                $cp = Invoke-NativeQuiet { docker cp $sc.FullName trafficdw-mssql:/tmp/_verify_analytics.sql }
+                if ($cp.ExitCode -ne 0) { $broken += "$($sc.BaseName) (copy failed)"; continue }
+
+                $r = Invoke-NativeQuiet {
+                    docker exec trafficdw-mssql /opt/mssql-tools18/bin/sqlcmd `
+                        -S localhost -U sa -P $SqlPassword -C -b -I -d TrafficDW -i /tmp/_verify_analytics.sql
+                }
+                if ($r.ExitCode -ne 0) {
+                    $msg = ($r.Output | Select-String -Pattern "^Msg \d+" | Select-Object -First 1)
+                    $broken += "$($sc.BaseName)$(if ($msg) { " - $($msg.Line.Trim())" })"
+                }
+                elseif ($r.Output | Select-String -Pattern "^\(0 rows affected\)" -Quiet) {
+                    $barren += $sc.BaseName
+                }
+            }
+
+            if ($broken) {
+                Add-Result "Analytics SQL" "FAIL" "$($broken.Count)/$($scripts.Count) failed: $($broken -join '; ')"
+            } elseif ($barren) {
+                Add-Result "Analytics SQL" "FAIL" "$($barren -join ', ') ran but returned an empty result set"
+            } else {
+                Add-Result "Analytics SQL" "PASS" "$($scripts.Count) script(s) executed, all returned rows"
+            }
+        }
+    }
 }
 
 # ---------------------------------------------------------- 6. tests ------
