@@ -6,6 +6,7 @@ A production-style Data Engineering project that turns high-volume operational t
 (sensors, cameras, traffic lights, weather stations, incident systems) into an analytical
 platform for historical analysis, BI reporting and decision making.
 
+Synthetic data throughout - no real traffic data is used.
 ---
 
 ## Architecture at a Glance
